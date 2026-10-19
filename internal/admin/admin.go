@@ -1228,6 +1228,18 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 				writeError(w, http.StatusBadRequest, "name or runtime_mode is required")
 				return
 			}
+			// Validate the mode before touching the row: otherwise an invalid
+			// mode rejects the request only after the name was already written.
+			if req.RuntimeMode != nil {
+				if err := domain.ValidateInstanceRuntimeMode(*req.RuntimeMode); err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				if s.Supervisor == nil {
+					writeError(w, http.StatusInternalServerError, "supervisor is not configured")
+					return
+				}
+			}
 			inst, err := s.Store.GetInstance(r.Context(), instanceID)
 			if err != nil {
 				writeError(w, http.StatusNotFound, err.Error())
@@ -1245,10 +1257,6 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 				}
 			}
 			if req.RuntimeMode != nil {
-				if s.Supervisor == nil {
-					writeError(w, http.StatusInternalServerError, "supervisor is not configured")
-					return
-				}
 				inst, err = s.Supervisor.SetRuntimeMode(r.Context(), instanceID, *req.RuntimeMode)
 				if err != nil {
 					writeError(w, http.StatusBadRequest, err.Error())

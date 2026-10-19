@@ -2138,6 +2138,31 @@ func TestInstanceRuntimeModeOverrideAdminRoutes(t *testing.T) {
 	serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{}`), http.StatusBadRequest)
 }
 
+func TestInstancePatchRejectsInvalidModeWithoutRenaming(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertService(ctx, domain.Service{ID: "echo", Name: "Echo", PackageSource: "fixture", PackageArtifactPath: "pkg", PackageSHA256: "pkgsha", DescriptorPath: "desc", DescriptorSHA256: "descsha", DescriptorVersion: "descsha", NodeEntry: "missing-entry", RuntimeMode: domain.RuntimeModeLongRunning}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Store: st, Supervisor: supervisor.New(dataDir, st)}
+	serveAdmin(t, srv, http.MethodPost, "/admin/v1/instances", bytes.NewBufferString(`{"id":"echo-test","service_id":"echo","name":"Echo Test","config":{},"secret":{},"start":false}`), http.StatusOK)
+
+	serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{"name":"Renamed","runtime_mode":"sometimes"}`), http.StatusBadRequest)
+
+	row, err := st.GetInstance(ctx, "echo-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Name != "Echo Test" {
+		t.Fatalf("name changed despite the rejected mode: %q", row.Name)
+	}
+}
+
 func TestServiceRoutesIncludeRuntimeMode(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

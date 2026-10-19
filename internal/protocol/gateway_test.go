@@ -1048,7 +1048,7 @@ func TestGatewayOnDemandUsesConfiguredTimeout(t *testing.T) {
 	defer st.Close()
 	item.Service.ServiceRoot = "services/echo"
 	writeOnDemandEntry(t, dataDir, "echo", item.Service.ServiceRoot, `#!/bin/sh
-sleep 5
+exec sleep 5
 `)
 	gateway := &Gateway{Store: st, DataDir: dataDir, OnDemandTimeout: 100 * time.Millisecond}
 	grpcCtx := metadata.NewIncomingContext(ctx, metadata.Pairs(
