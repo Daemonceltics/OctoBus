@@ -562,6 +562,7 @@ func (s *Supervisor) SetRuntimeMode(ctx context.Context, instanceID string, mode
 		return domain.Instance{}, err
 	}
 	before := domain.EffectiveRuntimeMode(svc, inst)
+	previousMode := inst.RuntimeMode
 	after := mode
 	if after == "" {
 		after = svc.RuntimeMode
@@ -583,9 +584,10 @@ func (s *Supervisor) SetRuntimeMode(ctx context.Context, instanceID string, mode
 		s.mu.Lock()
 		tracked := s.procs[instanceID] != nil
 		s.mu.Unlock()
+		startable := inst.Status == domain.StatusRunning || inst.Status == domain.StatusStopped ||
+			inst.Status == domain.StatusFailed || inst.Status == domain.StatusDegraded
 		switch {
-		case after == domain.RuntimeModeLongRunning && inst.Enabled && inst.PID == nil && !tracked &&
-			(inst.Status == domain.StatusStopped || inst.Status == domain.StatusFailed):
+		case after == domain.RuntimeModeLongRunning && inst.Enabled && inst.PID == nil && !tracked && startable:
 			if err := s.Start(ctx, instanceID); err != nil {
 				return inst, err
 			}
@@ -636,8 +638,34 @@ func (s *Supervisor) SetRuntimeMode(ctx context.Context, instanceID string, mode
 			return domain.Instance{}, err
 		}
 		if inst.Enabled {
-			if err := s.Start(ctx, instanceID); err != nil {
-				return inst, err
+			if startErr := s.Start(ctx, instanceID); startErr != nil {
+				// The switch has not completed. Restore the previous override and
+				// the logical on-demand state so the failed request does not leave
+				// the instance marked long-running without a process.
+				current, getErr := s.Store.GetInstance(ctx, instanceID)
+				if getErr == nil {
+					s.mu.Lock()
+					tracked := s.procs[instanceID] != nil
+					s.mu.Unlock()
+					if tracked || current.PID != nil {
+						_ = s.stopProcess(ctx, current, true)
+						if reloaded, reloadErr := s.Store.GetInstance(ctx, instanceID); reloadErr == nil {
+							current = reloaded
+						}
+					}
+					current.RuntimeMode = previousMode
+					current.Enabled = true
+					current.Status = domain.StatusRunning
+					current.PID = nil
+					current.ListenAddr = ""
+					if saveErr := s.Store.UpsertInstance(ctx, current); saveErr == nil {
+						inst = current
+						s.notifyInstanceChanged(instanceID)
+					} else {
+						s.logger().Error("runtime mode rollback failed", "instance_id", instanceID, "error", saveErr)
+					}
+				}
+				return inst, startErr
 			}
 			return s.Store.GetInstance(ctx, instanceID)
 		}

@@ -2187,6 +2187,12 @@ func TestInstancePatchModeFailureKeepsName(t *testing.T) {
 	if row.Name != "Echo Test" {
 		t.Fatalf("name changed although the mode switch failed: %q", row.Name)
 	}
+	if row.RuntimeMode != domain.RuntimeModeOnDemand {
+		t.Fatalf("failed switch changed runtime_mode: %q", row.RuntimeMode)
+	}
+	if row.Status != domain.StatusRunning || row.PID != nil {
+		t.Fatalf("failed switch left unexpected state: %+v", row)
+	}
 }
 
 func TestServiceRoutesIncludeRuntimeMode(t *testing.T) {

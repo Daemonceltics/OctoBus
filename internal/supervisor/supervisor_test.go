@@ -1045,6 +1045,27 @@ func TestSetRuntimeModeRetriesAFailedStart(t *testing.T) {
 	}
 }
 
+func TestSetRuntimeModeStartsAnUnstartedRunningInstance(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("helper process fixture is unix-oriented")
+	}
+	dataDir, st, entry := setupSupervisorHelperRuntime(t)
+	ctx := context.Background()
+	if err := st.UpsertInstance(ctx, domain.Instance{ID: "echo-test", ServiceID: "echo", Name: "Echo Test", Enabled: true, Status: domain.StatusRunning, RuntimeMode: domain.RuntimeModeLongRunning, NodeEntry: entry, ConfigJSON: []byte(`{}`), SecretJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	sup := New(dataDir, st)
+	defer func() { _ = sup.Shutdown(context.Background()) }()
+
+	updated, err := sup.SetRuntimeMode(ctx, "echo-test", domain.RuntimeModeLongRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PID == nil || updated.Status != domain.StatusRunning {
+		t.Fatalf("an unstarted long-running instance was not started: %+v", updated)
+	}
+}
+
 func TestRecoverEnabledSkipsOnDemandInstances(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
