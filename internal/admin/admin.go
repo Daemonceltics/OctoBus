@@ -1245,24 +1245,28 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 				writeError(w, http.StatusNotFound, err.Error())
 				return
 			}
-			if req.Name != nil {
-				if *req.Name == "" {
-					writeError(w, http.StatusBadRequest, "instance name must not be empty")
-					return
-				}
-				inst.Name = *req.Name
-				if err := s.Store.UpsertInstance(r.Context(), inst); err != nil {
-					writeError(w, http.StatusBadRequest, err.Error())
-					return
-				}
+			if req.Name != nil && *req.Name == "" {
+				writeError(w, http.StatusBadRequest, "instance name must not be empty")
+				return
 			}
+			// Apply the process lifecycle change first: it is the operation that
+			// can fail for external reasons. A failed switch leaves the name
+			// untouched. Only a database failure writing the name after a
+			// successful switch can leave the two fields out of step; a retry
+			// with the same values is idempotent.
 			if req.RuntimeMode != nil {
 				inst, err = s.Supervisor.SetRuntimeMode(r.Context(), instanceID, *req.RuntimeMode)
 				if err != nil {
 					writeError(w, http.StatusBadRequest, err.Error())
 					return
 				}
-			} else {
+			}
+			if req.Name != nil {
+				inst.Name = *req.Name
+				if err := s.Store.UpsertInstance(r.Context(), inst); err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
 				inst, err = s.Store.GetInstance(r.Context(), instanceID)
 				if err != nil {
 					writeError(w, http.StatusInternalServerError, err.Error())
