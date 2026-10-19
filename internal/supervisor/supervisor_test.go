@@ -970,6 +970,81 @@ func TestOnDemandInstanceLifecycleDoesNotStartProcess(t *testing.T) {
 	}
 }
 
+func TestSetRuntimeModeSwitchesResidentAndOnDemand(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("helper process fixture is unix-oriented")
+	}
+	dataDir, st, entry := setupSupervisorHelperRuntime(t)
+	ctx := context.Background()
+	if err := st.UpsertInstance(ctx, domain.Instance{ID: "echo-test", ServiceID: "echo", Name: "Echo Test", Enabled: false, Status: domain.StatusStopped, NodeEntry: entry, ConfigJSON: []byte(`{"token":"a"}`), SecretJSON: []byte(`{"apiToken":"s1"}`)}); err != nil {
+		t.Fatal(err)
+	}
+	sup := New(dataDir, st)
+	defer func() { _ = sup.Shutdown(context.Background()) }()
+	if err := sup.Start(ctx, "echo-test"); err != nil {
+		t.Fatal(err)
+	}
+	running, err := st.GetInstance(ctx, "echo-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if running.PID == nil || running.Status != domain.StatusRunning {
+		t.Fatalf("expected resident instance: %+v", running)
+	}
+
+	switched, err := sup.SetRuntimeMode(ctx, "echo-test", domain.RuntimeModeOnDemand)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if switched.RuntimeMode != domain.RuntimeModeOnDemand ||
+		!switched.Enabled || switched.Status != domain.StatusRunning ||
+		switched.PID != nil || switched.ListenAddr != "" {
+		t.Fatalf("unexpected on-demand instance: %+v", switched)
+	}
+	for _, action := range []struct {
+		name string
+		fn   func() error
+	}{
+		{"start", func() error { return sup.Start(ctx, "echo-test") }},
+		{"stop", func() error { return sup.Stop(ctx, "echo-test") }},
+		{"restart", func() error { return sup.Restart(ctx, "echo-test") }},
+	} {
+		if err := action.fn(); !errors.Is(err, ErrUnsupportedRuntimeControl) {
+			t.Fatalf("%s err=%v want ErrUnsupportedRuntimeControl", action.name, err)
+		}
+	}
+
+	inherited, err := sup.SetRuntimeMode(ctx, "echo-test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if inherited.RuntimeMode != "" || inherited.PID == nil ||
+		inherited.Status != domain.StatusRunning || inherited.ListenAddr == "" {
+		t.Fatalf("unexpected inherited long-running instance: %+v", inherited)
+	}
+}
+
+func TestSetRuntimeModeRetriesAFailedStart(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("helper process fixture is unix-oriented")
+	}
+	dataDir, st, entry := setupSupervisorHelperRuntime(t)
+	ctx := context.Background()
+	if err := st.UpsertInstance(ctx, domain.Instance{ID: "echo-test", ServiceID: "echo", Name: "Echo Test", Enabled: true, Status: domain.StatusFailed, RuntimeMode: domain.RuntimeModeLongRunning, NodeEntry: entry, ConfigJSON: []byte(`{}`), SecretJSON: []byte(`{}`)}); err != nil {
+		t.Fatal(err)
+	}
+	sup := New(dataDir, st)
+	defer func() { _ = sup.Shutdown(context.Background()) }()
+
+	updated, err := sup.SetRuntimeMode(ctx, "echo-test", domain.RuntimeModeLongRunning)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if updated.PID == nil || updated.Status != domain.StatusRunning {
+		t.Fatalf("a repeated switch did not restart the instance: %+v", updated)
+	}
+}
+
 func TestRecoverEnabledSkipsOnDemandInstances(t *testing.T) {
 	root := t.TempDir()
 	dataDir := filepath.Join(root, "data")
@@ -1400,6 +1475,42 @@ func TestRecoverEnabledStartsLongRunningAndSkipsOnDemandInMixedSet(t *testing.T)
 	}
 	if od.Status != domain.StatusRunning || od.PID != nil || od.ListenAddr != "" {
 		t.Fatalf("on-demand instance was mutated by recovery: %+v", od)
+	}
+}
+
+func TestRecoverEnabledUsesInstanceRuntimeModeOverride(t *testing.T) {
+	root := t.TempDir()
+	dataDir := filepath.Join(root, "data")
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	ctx := context.Background()
+	if err := st.UpsertService(ctx, domain.Service{ID: "echo", Name: "Echo", PackageSource: "fixture", PackageArtifactPath: "pkg", PackageSHA256: "pkgsha", DescriptorPath: "desc", DescriptorSHA256: "descsha", DescriptorVersion: "descsha", NodeEntry: "missing-entry", RuntimeMode: domain.RuntimeModeLongRunning}); err != nil {
+		t.Fatal(err)
+	}
+	for _, inst := range []domain.Instance{
+		{ID: "skip", ServiceID: "echo", Name: "Skip", Enabled: true, Status: domain.StatusRunning, RuntimeMode: domain.RuntimeModeOnDemand, NodeEntry: "missing-entry", ConfigJSON: []byte(`{}`)},
+		{ID: "start", ServiceID: "echo", Name: "Start", Enabled: true, Status: domain.StatusStopped, RuntimeMode: domain.RuntimeModeLongRunning, NodeEntry: "missing-entry", ConfigJSON: []byte(`{}`)},
+	} {
+		if err := st.UpsertInstance(ctx, inst); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sup := New(dataDir, st)
+	count, err := sup.RecoverEnabled(ctx)
+	if err == nil {
+		t.Fatal("expected the long-running instance to fail recovery")
+	}
+	if count != 1 {
+		t.Fatalf("recover count=%d want 1", count)
+	}
+	if !strings.Contains(err.Error(), "start:") {
+		t.Fatalf("recovery did not attempt the overridden long-running instance: %v", err)
+	}
+	if strings.Contains(err.Error(), "skip") {
+		t.Fatalf("recovery attempted an on-demand override: %v", err)
 	}
 }
 

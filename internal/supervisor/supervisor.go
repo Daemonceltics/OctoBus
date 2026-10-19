@@ -66,6 +66,8 @@ type CreateInstanceRequest struct {
 	Config    json.RawMessage `json:"config"`
 	Secret    json.RawMessage `json:"secret"`
 	Start     bool            `json:"start"`
+	// RuntimeMode overrides the Service mode for this instance; empty inherits.
+	RuntimeMode domain.RuntimeMode `json:"runtime_mode"`
 }
 
 func New(dataDir string, st *store.Store) *Supervisor {
@@ -89,6 +91,9 @@ func (s *Supervisor) CreateInstance(ctx context.Context, req CreateInstanceReque
 	if err := domain.ValidateID("instance", req.ID); err != nil {
 		return domain.Instance{}, err
 	}
+	if err := domain.ValidateInstanceRuntimeMode(req.RuntimeMode); err != nil {
+		return domain.Instance{}, err
+	}
 	svc, err := s.Store.GetService(ctx, req.ServiceID)
 	if err != nil {
 		return domain.Instance{}, err
@@ -110,15 +115,33 @@ func (s *Supervisor) CreateInstance(ctx context.Context, req CreateInstanceReque
 	if err := s.writeInstanceConfig(req.ID, config); err != nil {
 		return domain.Instance{}, err
 	}
+	effectiveMode := domain.EffectiveRuntimeMode(svc, domain.Instance{RuntimeMode: req.RuntimeMode})
+	// Re-creating an instance with the same id must not leave the previous
+	// resident process behind when the new mode is on-demand.
+	if effectiveMode == domain.RuntimeModeOnDemand {
+		if existing, getErr := s.Store.GetInstance(ctx, req.ID); getErr == nil {
+			s.mu.Lock()
+			tracked := s.procs[req.ID] != nil
+			s.mu.Unlock()
+			if existing.PID != nil || tracked {
+				s.mu.Lock()
+				s.nextGenerationLocked(req.ID)
+				s.mu.Unlock()
+				if err := s.stopProcess(ctx, existing, true); err != nil {
+					return domain.Instance{}, fmt.Errorf("stop resident process before switching to on-demand: %w", err)
+				}
+			}
+		}
+	}
 	start := req.Start
 	status := domain.StatusStopped
 	enabled := start
-	if svc.RuntimeMode == domain.RuntimeModeOnDemand {
+	if effectiveMode == domain.RuntimeModeOnDemand {
 		start = false
 		enabled = true
 		status = domain.StatusRunning
 	}
-	inst := domain.Instance{ID: req.ID, ServiceID: req.ServiceID, Name: req.Name, Enabled: enabled, Status: status, NodeEntry: svc.NodeEntry, ConfigJSON: config, ConfigSHA256: domain.ConfigHash(config), SecretJSON: secret, SecretSHA256: domain.HashBytes(secret)}
+	inst := domain.Instance{ID: req.ID, ServiceID: req.ServiceID, Name: req.Name, Enabled: enabled, Status: status, RuntimeMode: req.RuntimeMode, NodeEntry: svc.NodeEntry, ConfigJSON: config, ConfigSHA256: domain.ConfigHash(config), SecretJSON: secret, SecretSHA256: domain.HashBytes(secret)}
 	if inst.Name == "" {
 		inst.Name = req.ID
 	}
@@ -128,7 +151,7 @@ func (s *Supervisor) CreateInstance(ctx context.Context, req CreateInstanceReque
 	if err := s.Store.UpsertInstance(ctx, inst); err != nil {
 		return domain.Instance{}, err
 	}
-	s.logger().Info("instance_create", "instance_id", inst.ID, "service_id", inst.ServiceID, "runtime_mode", svc.RuntimeMode, "start", req.Start)
+	s.logger().Info("instance_create", "instance_id", inst.ID, "service_id", inst.ServiceID, "runtime_mode", effectiveMode, "start", req.Start)
 	if start {
 		if err := s.Start(ctx, req.ID); err != nil {
 			failed, getErr := s.Store.GetInstance(ctx, req.ID)
@@ -163,7 +186,7 @@ func (s *Supervisor) UpdateSecret(ctx context.Context, instanceID string, secret
 	}
 	s.logger().Info("instance_secret_updated", "instance_id", instanceID, "secret_sha256", inst.SecretSHA256, "restart", restart)
 	if restart {
-		if err := s.rejectOnDemandRuntimeControl(ctx, inst.ServiceID); err != nil {
+		if err := s.rejectOnDemandRuntimeControl(ctx, inst); err != nil {
 			return domain.Instance{}, err
 		}
 		if err := s.Restart(ctx, instanceID); err != nil {
@@ -198,7 +221,7 @@ func (s *Supervisor) UpdateConfig(ctx context.Context, instanceID string, config
 	}
 	s.logger().Info("instance_config_updated", "instance_id", instanceID, "config_sha256", inst.ConfigSHA256, "restart", restart)
 	if restart {
-		if err := s.rejectOnDemandRuntimeControl(ctx, inst.ServiceID); err != nil {
+		if err := s.rejectOnDemandRuntimeControl(ctx, inst); err != nil {
 			return domain.Instance{}, err
 		}
 		if err := s.Restart(ctx, instanceID); err != nil {
@@ -238,7 +261,7 @@ func (s *Supervisor) startWithAttempt(ctx context.Context, instanceID string, re
 			logger.Error("instance_start_failed", "instance_id", instanceID, "attempt", attempt, "error", startErr)
 		}
 	}()
-	if svc.RuntimeMode == domain.RuntimeModeOnDemand {
+	if domain.EffectiveRuntimeMode(svc, inst) == domain.RuntimeModeOnDemand {
 		startErr = ErrUnsupportedRuntimeControl
 		return ErrUnsupportedRuntimeControl
 	}
@@ -411,7 +434,7 @@ func (s *Supervisor) Stop(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.rejectOnDemandRuntimeControl(ctx, inst.ServiceID); err != nil {
+	if err := s.rejectOnDemandRuntimeControl(ctx, inst); err != nil {
 		return err
 	}
 	return s.stopProcess(ctx, inst, false)
@@ -463,7 +486,7 @@ func (s *Supervisor) Shutdown(ctx context.Context) error {
 		if getErr != nil {
 			return fmt.Errorf("%s: get service for supervisor shutdown: %w", id, getErr)
 		}
-		if svc.RuntimeMode != domain.RuntimeModeLongRunning {
+		if domain.EffectiveRuntimeMode(svc, inst) != domain.RuntimeModeLongRunning {
 			return nil
 		}
 		if err := s.stopProcess(ctx, inst, inst.Enabled); err != nil {
@@ -496,7 +519,7 @@ func (s *Supervisor) Restart(ctx context.Context, instanceID string) error {
 	if err != nil {
 		return err
 	}
-	if err := s.rejectOnDemandRuntimeControl(ctx, inst.ServiceID); err != nil {
+	if err := s.rejectOnDemandRuntimeControl(ctx, inst); err != nil {
 		return err
 	}
 	s.logger().Info("instance_restart_requested", "instance_id", instanceID)
@@ -517,6 +540,163 @@ func (s *Supervisor) Restart(ctx context.Context, instanceID string) error {
 	return s.Start(ctx, instanceID)
 }
 
+// SetRuntimeMode changes an instance's mode override ("" inherits the Service
+// mode). It only acts when the effective mode changes: a running resident
+// process must be stopped before the instance can be served on demand, and an
+// instance that becomes long-running again must be started when it is enabled.
+func (s *Supervisor) SetRuntimeMode(ctx context.Context, instanceID string, mode domain.RuntimeMode) (domain.Instance, error) {
+	if err := domain.ValidateInstanceRuntimeMode(mode); err != nil {
+		return domain.Instance{}, err
+	}
+	ctx, finishOperation, err := s.beginOperation(ctx)
+	if err != nil {
+		return domain.Instance{}, err
+	}
+	defer finishOperation()
+	inst, err := s.Store.GetInstance(ctx, instanceID)
+	if err != nil {
+		return domain.Instance{}, err
+	}
+	svc, err := s.Store.GetService(ctx, inst.ServiceID)
+	if err != nil {
+		return domain.Instance{}, err
+	}
+	before := domain.EffectiveRuntimeMode(svc, inst)
+	after := mode
+	if after == "" {
+		after = svc.RuntimeMode
+		if after == "" {
+			after = domain.RuntimeModeLongRunning
+		}
+	}
+	if before == after {
+		inst.RuntimeMode = mode
+		if err := s.Store.UpsertInstance(ctx, inst); err != nil {
+			return domain.Instance{}, err
+		}
+		inst, err = s.Store.GetInstance(ctx, instanceID)
+		if err != nil {
+			return domain.Instance{}, err
+		}
+		// Make a repeated switch idempotent: a previous attempt may have
+		// written the override and then failed to start (or stop) the process.
+		s.mu.Lock()
+		tracked := s.procs[instanceID] != nil
+		s.mu.Unlock()
+		switch {
+		case after == domain.RuntimeModeLongRunning && inst.Enabled && inst.PID == nil && !tracked &&
+			(inst.Status == domain.StatusStopped || inst.Status == domain.StatusFailed):
+			if err := s.Start(ctx, instanceID); err != nil {
+				return inst, err
+			}
+			return s.Store.GetInstance(ctx, instanceID)
+		case after == domain.RuntimeModeOnDemand && (inst.PID != nil || tracked):
+			if err := s.stopProcess(ctx, inst, true); err != nil {
+				return domain.Instance{}, err
+			}
+			inst, err = s.Store.GetInstance(ctx, instanceID)
+			if err != nil {
+				return domain.Instance{}, err
+			}
+			inst.Enabled = true
+			inst.Status = domain.StatusRunning
+			inst.PID = nil
+			inst.ListenAddr = ""
+			if err := s.Store.UpsertInstance(ctx, inst); err != nil {
+				return domain.Instance{}, err
+			}
+			s.notifyInstanceChanged(instanceID)
+		}
+		return inst, nil
+	}
+	switch {
+	case before == domain.RuntimeModeLongRunning && after == domain.RuntimeModeOnDemand:
+		s.mu.Lock()
+		s.nextGenerationLocked(instanceID)
+		s.mu.Unlock()
+		if err := s.stopProcess(ctx, inst, true); err != nil {
+			return domain.Instance{}, fmt.Errorf("stop resident process before switching to on-demand: %w", err)
+		}
+		inst, err = s.Store.GetInstance(ctx, instanceID)
+		if err != nil {
+			return domain.Instance{}, err
+		}
+		inst.RuntimeMode = mode
+		inst.Enabled = true
+		inst.Status = domain.StatusRunning
+		inst.PID = nil
+		inst.ListenAddr = ""
+	case before == domain.RuntimeModeOnDemand && after == domain.RuntimeModeLongRunning:
+		inst.RuntimeMode = mode
+		if err := s.Store.UpsertInstance(ctx, inst); err != nil {
+			return domain.Instance{}, err
+		}
+		inst, err = s.Store.GetInstance(ctx, instanceID)
+		if err != nil {
+			return domain.Instance{}, err
+		}
+		if inst.Enabled {
+			if err := s.Start(ctx, instanceID); err != nil {
+				return inst, err
+			}
+			return s.Store.GetInstance(ctx, instanceID)
+		}
+	default:
+		inst.RuntimeMode = mode
+	}
+	if err := s.Store.UpsertInstance(ctx, inst); err != nil {
+		return domain.Instance{}, err
+	}
+	s.notifyInstanceChanged(instanceID)
+	s.logger().Info("instance_runtime_mode_changed", "instance_id", instanceID, "before", before, "after", after, "override", mode)
+	return s.Store.GetInstance(ctx, instanceID)
+}
+
+// ApplyServiceRuntimeMode reconciles an instance after its Service's mode
+// changed. An instance that is now effectively on-demand must not keep a
+// resident process; one that stays long-running is left alone here (the import
+// path restarts those separately).
+func (s *Supervisor) ApplyServiceRuntimeMode(ctx context.Context, instanceID string) error {
+	ctx, finishOperation, err := s.beginOperation(ctx)
+	if err != nil {
+		return err
+	}
+	defer finishOperation()
+	inst, err := s.Store.GetInstance(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	svc, err := s.Store.GetService(ctx, inst.ServiceID)
+	if err != nil {
+		return err
+	}
+	if domain.EffectiveRuntimeMode(svc, inst) != domain.RuntimeModeOnDemand {
+		return nil
+	}
+	s.mu.Lock()
+	s.nextGenerationLocked(instanceID)
+	tracked := s.procs[instanceID] != nil
+	s.mu.Unlock()
+	if inst.PID != nil || tracked {
+		if err := s.stopProcess(ctx, inst, true); err != nil {
+			return fmt.Errorf("stop resident process after service switched to on-demand: %w", err)
+		}
+	}
+	inst, err = s.Store.GetInstance(ctx, instanceID)
+	if err != nil {
+		return err
+	}
+	inst.Enabled = true
+	inst.Status = domain.StatusRunning
+	inst.PID = nil
+	inst.ListenAddr = ""
+	if err := s.Store.UpsertInstance(ctx, inst); err != nil {
+		return err
+	}
+	s.notifyInstanceChanged(instanceID)
+	return nil
+}
+
 func (s *Supervisor) DeleteInstance(ctx context.Context, instanceID string) error {
 	inst, err := s.Store.GetInstance(ctx, instanceID)
 	if err != nil {
@@ -526,7 +706,7 @@ func (s *Supervisor) DeleteInstance(ctx context.Context, instanceID string) erro
 	if err != nil {
 		return err
 	}
-	if svc.RuntimeMode == domain.RuntimeModeOnDemand {
+	if domain.EffectiveRuntimeMode(svc, inst) == domain.RuntimeModeOnDemand {
 		if err := s.Store.DeleteInstance(ctx, instanceID); err != nil {
 			return err
 		}
@@ -543,12 +723,12 @@ func (s *Supervisor) DeleteInstance(ctx context.Context, instanceID string) erro
 	return nil
 }
 
-func (s *Supervisor) rejectOnDemandRuntimeControl(ctx context.Context, serviceID string) error {
-	svc, err := s.Store.GetService(ctx, serviceID)
+func (s *Supervisor) rejectOnDemandRuntimeControl(ctx context.Context, inst domain.Instance) error {
+	svc, err := s.Store.GetService(ctx, inst.ServiceID)
 	if err != nil {
 		return err
 	}
-	if svc.RuntimeMode == domain.RuntimeModeOnDemand {
+	if domain.EffectiveRuntimeMode(svc, inst) == domain.RuntimeModeOnDemand {
 		return ErrUnsupportedRuntimeControl
 	}
 	return nil
@@ -595,7 +775,8 @@ func (s *Supervisor) RecoverEnabled(ctx context.Context) (int, error) {
 SELECT i.id
 FROM instances i
 JOIN services s ON s.id = i.service_id
-WHERE i.enabled = 1 AND s.runtime_mode = ?
+WHERE i.enabled = 1
+  AND (CASE WHEN i.runtime_mode <> '' THEN i.runtime_mode ELSE s.runtime_mode END) = ?
 ORDER BY i.id`, string(domain.RuntimeModeLongRunning))
 	if err != nil {
 		return 0, err
@@ -671,7 +852,27 @@ func (s *Supervisor) writeInstanceConfig(instanceID string, config []byte) error
 	if err := os.MkdirAll(workdir, 0o700); err != nil {
 		return err
 	}
-	return os.WriteFile(filepath.Join(workdir, "config.json"), config, 0o600)
+	// On-demand invocations read this file while they start, so replace it
+	// atomically: a truncating write would let a concurrent call decode a
+	// partial JSON document.
+	tmp, err := os.CreateTemp(workdir, ".config-*")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer os.Remove(tmpName)
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(config); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmpName, filepath.Join(workdir, "config.json"))
 }
 
 func secretReadFile(secret []byte) (*os.File, func(), error) {
@@ -888,7 +1089,7 @@ func waitProcessDone(ctx context.Context, done <-chan struct{}, timeout time.Dur
 }
 
 func shouldStopOnShutdown(inst domain.Instance, svc domain.Service) bool {
-	if svc.RuntimeMode != domain.RuntimeModeLongRunning {
+	if domain.EffectiveRuntimeMode(svc, inst) != domain.RuntimeModeLongRunning {
 		return false
 	}
 	if inst.PID != nil {

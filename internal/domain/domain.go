@@ -70,14 +70,17 @@ type Method struct {
 }
 
 type Instance struct {
-	ID           string
-	ServiceID    string
-	Name         string
-	Enabled      bool
-	Status       InstanceStatus
-	PID          *int
-	ListenAddr   string
-	NodeEntry    string
+	ID         string
+	ServiceID  string
+	Name       string
+	Enabled    bool
+	Status     InstanceStatus
+	PID        *int
+	ListenAddr string
+	NodeEntry  string
+	// RuntimeMode overrides the Service mode for this instance. Empty means
+	// inherit; the effective mode is EffectiveRuntimeMode(service, instance).
+	RuntimeMode  RuntimeMode
 	ConfigJSON   json.RawMessage
 	ConfigSHA256 string
 	SecretJSON   json.RawMessage
@@ -252,6 +255,27 @@ func ValidateRuntimeMode(mode RuntimeMode) error {
 	default:
 		return fmt.Errorf("invalid runtime.mode %q: must be long-running or on-demand", mode)
 	}
+}
+
+// ValidateInstanceRuntimeMode accepts the empty override as "inherit the
+// Service mode" in addition to the two concrete modes.
+func ValidateInstanceRuntimeMode(mode RuntimeMode) error {
+	if mode == "" {
+		return nil
+	}
+	return ValidateRuntimeMode(mode)
+}
+
+// EffectiveRuntimeMode is the mode the supervisor and gateway must use for an
+// instance: its own override when set, otherwise the Service's mode.
+func EffectiveRuntimeMode(service Service, instance Instance) RuntimeMode {
+	if instance.RuntimeMode != "" {
+		return instance.RuntimeMode
+	}
+	if service.RuntimeMode == "" {
+		return RuntimeModeLongRunning
+	}
+	return service.RuntimeMode
 }
 
 func HashBytes(b []byte) string {

@@ -5,6 +5,7 @@ import (
 	"io"
 	"time"
 
+	"octobus/internal/domain"
 	"octobus/internal/store"
 
 	"google.golang.org/grpc"
@@ -33,7 +34,7 @@ func GRPCServer(gateway *Gateway) *grpc.Server {
 			return err
 		}
 		record.Service = item.Service.ID
-		if item.Service.RuntimeMode == "on-demand" && !item.Method.Unary {
+		if domain.EffectiveRuntimeMode(item.Service, item.Instance) == domain.RuntimeModeOnDemand && !item.Method.Unary {
 			return status.Error(codes.Unimplemented, "streaming methods are not supported by on-demand runtime")
 		}
 		switch {

@@ -62,6 +62,14 @@ type Gateway struct {
 	// RuntimeRulesPath is the egress rules on-demand runtimes load, as written
 	// by egressrules.Ensure. Required when RuntimeHardening is LevelNode.
 	RuntimeRulesPath string
+	// OnDemandTimeout bounds one on-demand invocation. Zero keeps the default.
+	OnDemandTimeout time.Duration
+	// OnDemandMaxOutputBytes bounds one on-demand process's stdout and stderr.
+	// Zero keeps the default.
+	OnDemandMaxOutputBytes int64
+	// OnDemandConcurrency bounds how many on-demand processes may run at once
+	// across all services. Zero keeps the default.
+	OnDemandConcurrency int
 
 	mu            sync.Mutex
 	conns         map[string]*grpc.ClientConn
@@ -76,7 +84,29 @@ const (
 	DefaultMaxRequestBytes int64 = 1 << 20
 	maxOnDemandConcurrent        = 32
 	maxOnDemandOutputBytes int64 = 8 << 20
+	maxOnDemandTimeout           = 30 * time.Second
 )
+
+func (g *Gateway) onDemandConcurrency() int {
+	if g.OnDemandConcurrency > 0 {
+		return g.OnDemandConcurrency
+	}
+	return maxOnDemandConcurrent
+}
+
+func (g *Gateway) onDemandOutputLimit() int64 {
+	if g.OnDemandMaxOutputBytes > 0 {
+		return g.OnDemandMaxOutputBytes
+	}
+	return maxOnDemandOutputBytes
+}
+
+func (g *Gateway) onDemandTimeout() time.Duration {
+	if g.OnDemandTimeout > 0 {
+		return g.OnDemandTimeout
+	}
+	return maxOnDemandTimeout
+}
 
 // onDemandWaitDelay bounds how long an invoke waits for output pipes after the
 // runtime exits. A descendant that inherited stdout/stderr would otherwise keep
@@ -195,7 +225,7 @@ func (g *Gateway) CatalogWithOptions(ctx context.Context, capsetID string, opts 
 		if opts.IncludeGRPC {
 			cat.GRPC = append(cat.GRPC, GRPCCatalogItem{
 				ServiceID:             item.Service.ID,
-				RuntimeMode:           string(item.Service.RuntimeMode),
+				RuntimeMode:           string(domain.EffectiveRuntimeMode(item.Service, item.Instance)),
 				InstanceID:            item.Instance.ID,
 				MethodFullName:        item.Method.FullName,
 				MethodPath:            "/" + item.Method.FullName,
@@ -213,7 +243,7 @@ func (g *Gateway) CatalogWithOptions(ctx context.Context, capsetID string, opts 
 		if opts.IncludeMCP {
 			cat.MCP = append(cat.MCP, MCPCatalogItem{
 				ServiceID:             item.Service.ID,
-				RuntimeMode:           string(item.Service.RuntimeMode),
+				RuntimeMode:           string(domain.EffectiveRuntimeMode(item.Service, item.Instance)),
 				InstanceID:            item.Instance.ID,
 				MethodFullName:        item.Method.FullName,
 				Endpoint:              fmt.Sprintf("/capsets/%s/mcp", item.Capset.ID),
@@ -228,7 +258,7 @@ func (g *Gateway) CatalogWithOptions(ctx context.Context, capsetID string, opts 
 		if opts.IncludeConnect {
 			cat.ConnectRPC = append(cat.ConnectRPC, ConnectRPCCatalogItem{
 				ServiceID:             item.Service.ID,
-				RuntimeMode:           string(item.Service.RuntimeMode),
+				RuntimeMode:           string(domain.EffectiveRuntimeMode(item.Service, item.Instance)),
 				InstanceID:            item.Instance.ID,
 				MethodFullName:        item.Method.FullName,
 				Procedure:             "/" + item.Method.FullName,
@@ -1525,7 +1555,7 @@ func bearerToken(value string) string {
 }
 
 func (g *Gateway) invokeRaw(ctx context.Context, item store.ExposedMethod, req []byte) ([]byte, error) {
-	if item.Service.RuntimeMode == domain.RuntimeModeOnDemand {
+	if domain.EffectiveRuntimeMode(item.Service, item.Instance) == domain.RuntimeModeOnDemand {
 		if !item.Method.Unary {
 			return nil, status.Error(codes.Unimplemented, "streaming methods are not supported by on-demand runtime")
 		}
@@ -1552,7 +1582,7 @@ func (g *Gateway) invokeRaw(ctx context.Context, item store.ExposedMethod, req [
 }
 
 func (g *Gateway) newBackendStream(ctx context.Context, item store.ExposedMethod) (grpc.ClientStream, error) {
-	if item.Service.RuntimeMode == domain.RuntimeModeOnDemand {
+	if domain.EffectiveRuntimeMode(item.Service, item.Instance) == domain.RuntimeModeOnDemand {
 		return nil, status.Error(codes.Unimplemented, "streaming methods are not supported by on-demand runtime")
 	}
 	if item.Instance.ListenAddr == "" || string(item.Instance.Status) != "running" {
@@ -1582,9 +1612,12 @@ func (g *Gateway) invokeOnDemand(ctx context.Context, item store.ExposedMethod, 
 	if dataDir == "" {
 		return nil, status.Error(codes.Internal, "gateway data dir is not configured")
 	}
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	ctx, cancel := context.WithTimeout(ctx, g.onDemandTimeout())
 	defer cancel()
 	if !g.acquireOnDemandSlot(ctx) {
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return nil, status.FromContextError(ctxErr).Err()
+		}
 		return nil, status.Error(codes.ResourceExhausted, "on-demand invocation capacity exhausted")
 	}
 	defer g.releaseOnDemandSlot()
@@ -1664,8 +1697,8 @@ func (g *Gateway) invokeOnDemand(ctx context.Context, item store.ExposedMethod, 
 	cmd.WaitDelay = onDemandWaitDelay
 	cmd.Stdin = bytes.NewReader(req)
 	var stdout, stderr boundedBuffer
-	stdout.Limit = maxOnDemandOutputBytes
-	stderr.Limit = maxOnDemandOutputBytes
+	stdout.Limit = g.onDemandOutputLimit()
+	stderr.Limit = g.onDemandOutputLimit()
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	err = cmd.Run()
@@ -1694,10 +1727,17 @@ func (g *Gateway) invokeOnDemand(ctx context.Context, item store.ExposedMethod, 
 		// an ExitError instead; the ExitError check is defensive.
 		err = nil
 	}
-	if ctx.Err() == context.DeadlineExceeded {
-		return nil, status.Error(codes.DeadlineExceeded, "on-demand invoke timed out")
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return nil, status.FromContextError(ctxErr).Err()
 	}
 	if err != nil {
+		if _, _, structured := parseOctobusError(stderr.String()); !structured && g.Logger != nil {
+			g.Logger.Warn("runtime_on_demand_failed",
+				"service_id", item.Service.ID,
+				"instance_id", item.Instance.ID,
+				"method", item.Method.FullName,
+				"stderr", logPreview(stderr.String(), 1024))
+		}
 		return nil, onDemandProcessError(err, stderr.String())
 	}
 	if stdout.Truncated || stderr.Truncated {
@@ -1740,7 +1780,7 @@ func (b *boundedBuffer) String() string {
 
 func (g *Gateway) acquireOnDemandSlot(ctx context.Context) bool {
 	g.onDemandOnce.Do(func() {
-		g.onDemandSlots = make(chan struct{}, maxOnDemandConcurrent)
+		g.onDemandSlots = make(chan struct{}, g.onDemandConcurrency())
 	})
 	select {
 	case g.onDemandSlots <- struct{}{}:
@@ -1819,13 +1859,24 @@ func egressRefusals(stderrText string) []string {
 	return reasons
 }
 
+func logPreview(value string, limit int) string {
+	value = strings.TrimSpace(value)
+	if len(value) <= limit {
+		return value
+	}
+	return value[:limit] + "…"
+}
+
 func onDemandProcessError(err error, stderrText string) error {
 	if code, message, ok := parseOctobusError(stderrText); ok {
 		return status.Error(code, message)
 	}
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
-		return status.Error(codes.Internal, strings.TrimSpace(stderrText))
+		// Do not return the runtime's raw stderr: it is service-controlled and
+		// may contain credentials or internal details the caller is not
+		// entitled to. The daemon logs a bounded preview instead.
+		return status.Error(codes.Internal, "on-demand runtime exited unsuccessfully")
 	}
 	return status.Error(codes.Unavailable, err.Error())
 }
@@ -1839,7 +1890,9 @@ func parseOctobusError(stderrText string) (codes.Code, string, bool) {
 		}
 		const prefix = "OCTOBUS_ERROR:"
 		if !strings.HasPrefix(line, prefix) {
-			return codes.OK, "", false
+			// The runtime may print diagnostics after its structured error;
+			// keep scanning rather than leaking the whole stderr.
+			continue
 		}
 		var payload struct {
 			Code    string `json:"code"`

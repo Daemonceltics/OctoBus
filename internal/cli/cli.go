@@ -494,10 +494,10 @@ func (c *CLI) instanceCommand() *cobra.Command {
 }
 
 func (c *CLI) instanceCreateCommand() *cobra.Command {
-	var serviceID, name, configPath, configJSON, secretPath, secretJSON string
+	var serviceID, name, configPath, configJSON, secretPath, secretJSON, runtimeMode string
 	var noStart bool
 	cmd := &cobra.Command{
-		Use:   "create INSTANCE --service SERVICE [--name NAME] [--config CONFIG | --config-json JSON] [--secret SECRET | --secret-json JSON] [--no-start]",
+		Use:   "create INSTANCE --service SERVICE [--name NAME] [--config CONFIG | --config-json JSON] [--secret SECRET | --secret-json JSON] [--runtime-mode MODE] [--no-start]",
 		Short: "Create an instance",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
@@ -526,7 +526,11 @@ func (c *CLI) instanceCreateCommand() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return c.request(http.MethodPost, "/admin/v1/instances", map[string]any{"id": args[0], "service_id": serviceID, "name": name, "config": config, "secret": secret, "start": !noStart})
+			payload := map[string]any{"id": args[0], "service_id": serviceID, "name": name, "config": config, "secret": secret, "start": !noStart}
+			if runtimeMode != "" {
+				payload["runtime_mode"] = runtimeMode
+			}
+			return c.request(http.MethodPost, "/admin/v1/instances", payload)
 		},
 	}
 	cmd.Flags().StringVar(&serviceID, "service", "", "service id")
@@ -535,14 +539,15 @@ func (c *CLI) instanceCreateCommand() *cobra.Command {
 	cmd.Flags().StringVar(&configJSON, "config-json", "", "config JSON string")
 	cmd.Flags().StringVar(&secretPath, "secret", "", "secret JSON path")
 	cmd.Flags().StringVar(&secretJSON, "secret-json", "", "secret JSON string")
+	cmd.Flags().StringVar(&runtimeMode, "runtime-mode", "", "override the service runtime mode: long-running or on-demand")
 	cmd.Flags().BoolVar(&noStart, "no-start", false, "do not start instance after create")
 	return cmd
 }
 
 func (c *CLI) instanceUpdateCommand() *cobra.Command {
-	var name string
+	var name, runtimeMode string
 	cmd := &cobra.Command{
-		Use:   "update INSTANCE --name NAME",
+		Use:   "update INSTANCE [--name NAME] [--runtime-mode MODE]",
 		Short: "Update instance metadata",
 		Args: func(cmd *cobra.Command, args []string) error {
 			if len(args) < 1 {
@@ -554,16 +559,24 @@ func (c *CLI) instanceUpdateCommand() *cobra.Command {
 			return nil
 		},
 		PreRunE: func(cmd *cobra.Command, args []string) error {
-			if name == "" {
-				return errors.New("instance name is required")
+			if name == "" && !cmd.Flags().Changed("runtime-mode") {
+				return errors.New("instance name or runtime mode is required")
 			}
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, args []string) error {
-			return c.request(http.MethodPatch, "/admin/v1/instances/"+args[0], map[string]any{"name": name})
+			payload := map[string]any{}
+			if name != "" {
+				payload["name"] = name
+			}
+			if cmd.Flags().Changed("runtime-mode") {
+				payload["runtime_mode"] = runtimeMode
+			}
+			return c.request(http.MethodPatch, "/admin/v1/instances/"+args[0], payload)
 		},
 	}
 	cmd.Flags().StringVar(&name, "name", "", "instance name")
+	cmd.Flags().StringVar(&runtimeMode, "runtime-mode", "", "override the service runtime mode: long-running, on-demand, or empty to inherit")
 	return cmd
 }
 
