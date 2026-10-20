@@ -1,39 +1,8 @@
-FROM ubuntu:26.04 AS builder
-
-ARG GOPROXY=https://proxy.golang.org,direct
-ENV DEBIAN_FRONTEND=noninteractive \
-	GOTOOLCHAIN=auto \
-	GOPROXY=${GOPROXY}
-WORKDIR /src
-
-RUN apt-get update \
-	&& apt-get install -y --no-install-recommends \
-		ca-certificates \
-		git \
-		golang-go \
-		make \
-		nodejs \
-		npm \
-		protobuf-compiler \
-		libprotobuf-dev \
-	&& rm -rf /var/lib/apt/lists/*
-
-COPY go.mod go.sum ./
-RUN go mod download
-
-COPY . .
-ARG OCTOBUS_VERSION
-ARG OCTOBUS_COMMIT
-ARG OCTOBUS_BUILD_DATE
-RUN bash ./scripts/build-octobus.sh /out/octobus \
-	&& if LC_ALL=C ldd /out/octobus 2>&1 | grep -q "not a dynamic executable"; then \
-		true; \
-	else \
-		echo "/out/octobus is dynamically linked; expected a static binary" >&2; \
-		LC_ALL=C ldd /out/octobus >&2; \
-		exit 1; \
-	fi
-
+# The octobus binary is not compiled here. Compile it for the target platform
+# first (scripts/build-octobus.sh, GOOS=linux GOARCH=<arch>) and put the result
+# in dist/ in the build context — the image only packages it. Keeping the
+# toolchain out of the image lets CI build linux/arm64 natively instead of
+# running the whole toolchain under QEMU.
 FROM ubuntu:26.04
 
 ENV DEBIAN_FRONTEND=noninteractive \
@@ -53,7 +22,8 @@ RUN apt-get update \
 	&& groupadd --system octobus \
 	&& useradd --system --gid octobus --home-dir /var/lib/octobus --create-home --shell /usr/sbin/nologin octobus
 
-COPY --from=builder /out/octobus /usr/local/bin/octobus
+ARG TARGETARCH
+COPY dist/octobus-linux-${TARGETARCH} /usr/local/bin/octobus
 
 USER octobus
 WORKDIR /var/lib/octobus

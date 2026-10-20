@@ -11,6 +11,7 @@ fixture_dir="$(mktemp -d)"
 status_file="$(mktemp)"
 import_body="$(mktemp)"
 import_status="$(mktemp)"
+daemon_arch=""
 
 cleanup() {
 	docker rm -f "$container_name" >/dev/null 2>&1 || true
@@ -38,6 +39,11 @@ fs.writeFileSync(path, `${JSON.stringify(pkg, null, 2)}\n`);
 NODE
 chmod -R a+rX "$fixture_dir"
 
+# The image packages a prebuilt binary, so compile it for the daemon's
+# architecture before building.
+daemon_arch="$(docker version --format '{{.Server.Arch}}')"
+mkdir -p "$repo_root/dist"
+GOOS=linux GOARCH="$daemon_arch" bash "$repo_root/scripts/build-octobus.sh" "$repo_root/dist/octobus-linux-$daemon_arch"
 docker build -f "$repo_root/docker/Dockerfile" -t "$image" "$repo_root"
 docker volume create "$volume_name" >/dev/null
 

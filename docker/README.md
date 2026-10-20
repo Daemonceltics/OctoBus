@@ -1,20 +1,26 @@
 # Docker Image
 
-The OctoBus image is built from `ubuntu:26.04` and includes the `octobus`
-binary plus the runtime tools used by service package workflows:
+The OctoBus image is built from `ubuntu:26.04` and packages a prebuilt
+`octobus` binary plus the runtime tools used by service package workflows:
 
-- Go from Ubuntu's repositories for the build stage, using Go's automatic
-  toolchain selection when module dependencies require a newer 1.26 patch
 - `node` and `npm` for JavaScript service packages
 - `protoc` for descriptor compilation during service import
 - `git` for HTTPS Git service sources
 - `ca-certificates` and `curl` for TLS access and container health checks
 
-Build the image from the repository root:
+The image does not compile anything. Build the binary for the target platform
+first and put it in `dist/` in the build context — CI cross-compiles both
+platforms this way, which keeps arm64 builds off QEMU:
 
 ```bash
+mkdir -p dist
+GOOS=linux GOARCH=amd64 bash ./scripts/build-octobus.sh dist/octobus-linux-amd64
+GOOS=linux GOARCH=arm64 bash ./scripts/build-octobus.sh dist/octobus-linux-arm64
 docker build -f docker/Dockerfile -t octobus:dev .
 ```
+
+`docker build` selects the binary matching `TARGETARCH`, so on an arm64 host
+omit the amd64 line (and vice versa) if you only need the local architecture.
 
 Run the daemon:
 
@@ -72,3 +78,6 @@ instance and capset, then invokes the service through Connect RPC:
 ```bash
 docker/smoke.sh octobus:dev
 ```
+
+The smoke script compiles the binary for the Docker daemon's architecture
+itself, so no manual build step is needed for it.
