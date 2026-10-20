@@ -1038,6 +1038,33 @@ cat
 	}
 }
 
+func TestGatewayOnDemandUsesConfiguredTimeout(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("shell fixture is unix-only")
+	}
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, item, reqRaw, _ := seedOnDemandGateway(t, dataDir)
+	defer st.Close()
+	item.Service.ServiceRoot = "services/echo"
+	writeOnDemandEntry(t, dataDir, "echo", item.Service.ServiceRoot, `#!/bin/sh
+exec sleep 5
+`)
+	gateway := &Gateway{Store: st, DataDir: dataDir, OnDemandTimeout: 100 * time.Millisecond}
+	grpcCtx := metadata.NewIncomingContext(ctx, metadata.Pairs(
+		"x-octobus-capset", "dev",
+		"x-octobus-instance", "echo-test",
+	))
+	start := time.Now()
+	_, err := gateway.invokeRaw(grpcCtx, item, reqRaw)
+	if status.Code(err) != codes.DeadlineExceeded {
+		t.Fatalf("code=%v err=%v", status.Code(err), err)
+	}
+	if elapsed := time.Since(start); elapsed > 2*time.Second {
+		t.Fatalf("configured timeout was not applied: %s", elapsed)
+	}
+}
+
 func TestGatewayOnDemandConcurrentRequestsUseIndependentMetadataFiles(t *testing.T) {
 	if runtime.GOOS == "windows" {
 		t.Skip("shell fixture is unix-only")
@@ -1142,8 +1169,10 @@ echo 'OCTOBUS_ERROR:{"code":"INVALID_ARGUMENT","message":"bad"}' >&2
 echo 'trailing log' >&2
 exit 9
 `)
-	if _, err := gateway.invokeRaw(grpcCtx, item, reqRaw); status.Code(err) != codes.Internal {
+	if _, err := gateway.invokeRaw(grpcCtx, item, reqRaw); status.Code(err) != codes.InvalidArgument {
 		t.Fatalf("trailing stderr after OCTOBUS_ERROR code=%v err=%v", status.Code(err), err)
+	} else if strings.Contains(status.Convert(err).Message(), "trailing log") {
+		t.Fatalf("trailing stderr leaked to the caller: %v", err)
 	}
 
 	writeOnDemandEntry(t, dataDir, "echo", item.Service.ServiceRoot, `#!/bin/sh

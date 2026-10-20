@@ -2,6 +2,11 @@ name: Service L2 gate
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -9,8 +14,9 @@ permissions:
 jobs:
   service-l2-gate:
     name: service-l2-gate
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 15
     steps:
       - name: Checkout pull request
         uses: actions/checkout@v4

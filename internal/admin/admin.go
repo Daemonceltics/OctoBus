@@ -60,45 +60,70 @@ var defaultServiceImportMultipartLimits = serviceImportMultipartLimits{
 }
 
 type instanceResponse struct {
-	ID           string                `json:"ID"`
-	ServiceID    string                `json:"ServiceID"`
-	Name         string                `json:"Name"`
-	Enabled      bool                  `json:"Enabled"`
-	Status       domain.InstanceStatus `json:"Status"`
-	PID          *int                  `json:"PID,omitempty"`
-	ListenAddr   string                `json:"ListenAddr"`
-	NodeEntry    string                `json:"NodeEntry"`
-	ConfigJSON   json.RawMessage       `json:"ConfigJSON"`
-	ConfigSHA256 string                `json:"ConfigSHA256"`
-	SecretSHA256 string                `json:"SecretSHA256"`
-	HasSecret    bool                  `json:"HasSecret"`
-	CreatedAt    time.Time             `json:"CreatedAt"`
-	UpdatedAt    time.Time             `json:"UpdatedAt"`
+	ID                   string                `json:"ID"`
+	ServiceID            string                `json:"ServiceID"`
+	Name                 string                `json:"Name"`
+	Enabled              bool                  `json:"Enabled"`
+	Status               domain.InstanceStatus `json:"Status"`
+	PID                  *int                  `json:"PID,omitempty"`
+	ListenAddr           string                `json:"ListenAddr"`
+	NodeEntry            string                `json:"NodeEntry"`
+	RuntimeMode          domain.RuntimeMode    `json:"RuntimeMode"`
+	EffectiveRuntimeMode domain.RuntimeMode    `json:"EffectiveRuntimeMode"`
+	ConfigJSON           json.RawMessage       `json:"ConfigJSON"`
+	ConfigSHA256         string                `json:"ConfigSHA256"`
+	SecretSHA256         string                `json:"SecretSHA256"`
+	HasSecret            bool                  `json:"HasSecret"`
+	CreatedAt            time.Time             `json:"CreatedAt"`
+	UpdatedAt            time.Time             `json:"UpdatedAt"`
 }
 
-func newInstanceResponse(inst domain.Instance) instanceResponse {
+func newInstanceResponse(inst domain.Instance, effective domain.RuntimeMode) instanceResponse {
 	return instanceResponse{
-		ID:           inst.ID,
-		ServiceID:    inst.ServiceID,
-		Name:         inst.Name,
-		Enabled:      inst.Enabled,
-		Status:       inst.Status,
-		PID:          inst.PID,
-		ListenAddr:   inst.ListenAddr,
-		NodeEntry:    inst.NodeEntry,
-		ConfigJSON:   inst.ConfigJSON,
-		ConfigSHA256: inst.ConfigSHA256,
-		SecretSHA256: inst.SecretSHA256,
-		HasSecret:    len(inst.SecretJSON) > 0 && string(inst.SecretJSON) != "{}",
-		CreatedAt:    inst.CreatedAt,
-		UpdatedAt:    inst.UpdatedAt,
+		ID:                   inst.ID,
+		ServiceID:            inst.ServiceID,
+		Name:                 inst.Name,
+		Enabled:              inst.Enabled,
+		Status:               inst.Status,
+		PID:                  inst.PID,
+		ListenAddr:           inst.ListenAddr,
+		NodeEntry:            inst.NodeEntry,
+		RuntimeMode:          inst.RuntimeMode,
+		EffectiveRuntimeMode: effective,
+		ConfigJSON:           inst.ConfigJSON,
+		ConfigSHA256:         inst.ConfigSHA256,
+		SecretSHA256:         inst.SecretSHA256,
+		HasSecret:            len(inst.SecretJSON) > 0 && string(inst.SecretJSON) != "{}",
+		CreatedAt:            inst.CreatedAt,
+		UpdatedAt:            inst.UpdatedAt,
 	}
 }
 
-func newInstanceResponses(instances []domain.Instance) []instanceResponse {
+func (s *Server) instanceResponse(ctx context.Context, inst domain.Instance) instanceResponse {
+	effective := domain.RuntimeModeLongRunning
+	if svc, err := s.Store.GetService(ctx, inst.ServiceID); err == nil {
+		effective = domain.EffectiveRuntimeMode(svc, inst)
+	}
+	return newInstanceResponse(inst, effective)
+}
+
+func (s *Server) instanceResponses(ctx context.Context, instances []domain.Instance) []instanceResponse {
+	services := make(map[string]domain.Service, len(instances))
 	out := make([]instanceResponse, len(instances))
 	for i, inst := range instances {
-		out[i] = newInstanceResponse(inst)
+		svc, ok := services[inst.ServiceID]
+		if !ok {
+			var err error
+			svc, err = s.Store.GetService(ctx, inst.ServiceID)
+			if err == nil {
+				services[inst.ServiceID] = svc
+			}
+		}
+		effective := domain.RuntimeModeLongRunning
+		if svc.ID != "" {
+			effective = domain.EffectiveRuntimeMode(svc, inst)
+		}
+		out[i] = newInstanceResponse(inst, effective)
 	}
 	return out
 }
@@ -1019,12 +1044,31 @@ func readSchemaContent(path string) (json.RawMessage, error) {
 // a restart both the preview and the restart itself select the same way. The
 // runtime mode is decided by the caller, because a real import decides it from
 // the row it just wrote while a preview decides it from the row it would write.
-func (s *Server) restartTargets(ctx context.Context, serviceID string) ([]string, error) {
+func instanceEffectiveMode(inst domain.Instance, serviceMode domain.RuntimeMode) domain.RuntimeMode {
+	if inst.RuntimeMode != "" {
+		return inst.RuntimeMode
+	}
+	if serviceMode == "" {
+		return domain.RuntimeModeLongRunning
+	}
+	return serviceMode
+}
+
+// restartTargets lists the enabled instances of a service whose effective mode
+// is long-running. runtimeMode is the mode the service has (or is about to
+// get), because an instance override wins over it.
+func (s *Server) restartTargets(ctx context.Context, serviceID string, runtimeMode domain.RuntimeMode) ([]string, error) {
 	instances, err := s.Store.ListEnabledInstancesByService(ctx, serviceID)
 	if err != nil {
 		return nil, err
 	}
-	return instanceIDs(instances), nil
+	ids := make([]string, 0, len(instances))
+	for _, inst := range instances {
+		if instanceEffectiveMode(inst, runtimeMode) == domain.RuntimeModeLongRunning {
+			ids = append(ids, inst.ID)
+		}
+	}
+	return ids, nil
 }
 
 // wouldRestartInstances reports which instances a real import would restart,
@@ -1035,10 +1079,10 @@ func (s *Server) restartTargets(ctx context.Context, serviceID string) ([]string
 // that do not exist yet report no instances — a preview field is not worth
 // failing the response over.
 func (s *Server) wouldRestartInstances(ctx context.Context, serviceID string, runtimeMode domain.RuntimeMode) []string {
-	if s.Supervisor == nil || runtimeMode == domain.RuntimeModeOnDemand {
+	if s.Supervisor == nil {
 		return []string{}
 	}
-	targets, err := s.restartTargets(ctx, serviceID)
+	targets, err := s.restartTargets(ctx, serviceID, runtimeMode)
 	if err != nil {
 		return []string{}
 	}
@@ -1063,17 +1107,43 @@ func (s *Server) restartEnabledServiceInstances(ctx context.Context, serviceID s
 	if err != nil {
 		return nil, []string{err.Error()}
 	}
-	if svc.RuntimeMode == domain.RuntimeModeOnDemand {
-		return []string{}, []string{}
-	}
-	targets, err := s.restartTargets(ctx, serviceID)
+	instances, err := s.Store.ListEnabledInstancesByService(ctx, serviceID)
 	if err != nil {
 		return nil, []string{err.Error()}
 	}
-	s.logger().Info("service_instances_restart_started", "service_id", serviceID, "count", len(targets))
 	var restarted []string
 	errsByInstance := make(map[string]string)
-	errs := supervisor.RunBounded(targets, 4, func(id string) error {
+	type action struct {
+		id       string
+		onDemand bool
+	}
+	actions := make([]action, 0, len(instances))
+	for _, inst := range instances {
+		if instanceEffectiveMode(inst, svc.RuntimeMode) == domain.RuntimeModeOnDemand {
+			actions = append(actions, action{id: inst.ID, onDemand: true})
+			continue
+		}
+		actions = append(actions, action{id: inst.ID})
+	}
+	if len(actions) == 0 {
+		s.logger().Info("service_instances_restart_started", "service_id", serviceID, "count", 0)
+		s.logger().Info("service_instances_restart_done", "service_id", serviceID, "restarted_count", 0, "failed_count", 0)
+		return []string{}, []string{}
+	}
+	s.logger().Info("service_instances_restart_started", "service_id", serviceID, "count", len(actions))
+	ids := make([]string, len(actions))
+	onDemand := make(map[string]bool, len(actions))
+	for i, a := range actions {
+		ids[i] = a.id
+		onDemand[a.id] = a.onDemand
+	}
+	errs := supervisor.RunBounded(ids, 4, func(id string) error {
+		if onDemand[id] {
+			if err := s.Supervisor.ApplyServiceRuntimeMode(ctx, id); err != nil {
+				return fmt.Errorf("%s: %w", id, err)
+			}
+			return nil
+		}
 		if err := s.Supervisor.Restart(ctx, id); err != nil {
 			return fmt.Errorf("%s: %w", id, err)
 		}
@@ -1085,14 +1155,14 @@ func (s *Server) restartEnabledServiceInstances(ctx context.Context, serviceID s
 			errsByInstance[parts[0]] = err.Error()
 		}
 	}
-	for _, id := range targets {
-		if msg := errsByInstance[id]; msg != "" {
+	for _, id := range ids {
+		if msg := errsByInstance[id]; msg != "" || onDemand[id] {
 			continue
 		}
 		restarted = append(restarted, id)
 	}
 	var errStrings []string
-	for _, id := range targets {
+	for _, id := range ids {
 		if msg := errsByInstance[id]; msg != "" {
 			errStrings = append(errStrings, msg)
 		}
@@ -1104,14 +1174,6 @@ func (s *Server) restartEnabledServiceInstances(ctx context.Context, serviceID s
 	return restarted, errStrings
 }
 
-func instanceIDs(instances []domain.Instance) []string {
-	ids := make([]string, len(instances))
-	for i, inst := range instances {
-		ids[i] = inst.ID
-	}
-	return ids
-}
-
 func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
@@ -1120,7 +1182,7 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"instances": newInstanceResponses(instances)})
+		writeJSON(w, http.StatusOK, map[string]any{"instances": s.instanceResponses(r.Context(), instances)})
 	case http.MethodPost:
 		var req supervisor.CreateInstanceRequest
 		if err := readJSON(r, &req); err != nil {
@@ -1132,7 +1194,7 @@ func (s *Server) handleInstances(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, newInstanceResponse(inst))
+		writeJSON(w, http.StatusOK, s.instanceResponse(r.Context(), inst))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
@@ -1152,35 +1214,66 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 				writeError(w, http.StatusNotFound, err.Error())
 				return
 			}
-			writeJSON(w, http.StatusOK, newInstanceResponse(inst))
+			writeJSON(w, http.StatusOK, s.instanceResponse(r.Context(), inst))
 		case http.MethodPatch:
 			var req struct {
-				Name string `json:"name"`
+				Name        *string             `json:"name"`
+				RuntimeMode *domain.RuntimeMode `json:"runtime_mode"`
 			}
 			if err := readJSON(r, &req); err != nil {
 				writeError(w, http.StatusBadRequest, err.Error())
 				return
+			}
+			if req.Name == nil && req.RuntimeMode == nil {
+				writeError(w, http.StatusBadRequest, "name or runtime_mode is required")
+				return
+			}
+			// Validate the mode before touching the row: otherwise an invalid
+			// mode rejects the request only after the name was already written.
+			if req.RuntimeMode != nil {
+				if err := domain.ValidateInstanceRuntimeMode(*req.RuntimeMode); err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				if s.Supervisor == nil {
+					writeError(w, http.StatusInternalServerError, "supervisor is not configured")
+					return
+				}
 			}
 			inst, err := s.Store.GetInstance(r.Context(), instanceID)
 			if err != nil {
 				writeError(w, http.StatusNotFound, err.Error())
 				return
 			}
-			if req.Name == "" {
-				writeError(w, http.StatusBadRequest, "instance name is required")
+			if req.Name != nil && *req.Name == "" {
+				writeError(w, http.StatusBadRequest, "instance name must not be empty")
 				return
 			}
-			inst.Name = req.Name
-			if err := s.Store.UpsertInstance(r.Context(), inst); err != nil {
-				writeError(w, http.StatusBadRequest, err.Error())
-				return
+			// Apply the process lifecycle change first: it is the operation that
+			// can fail for external reasons. A failed switch leaves the name
+			// untouched. Only a database failure writing the name after a
+			// successful switch can leave the two fields out of step; a retry
+			// with the same values is idempotent.
+			if req.RuntimeMode != nil {
+				inst, err = s.Supervisor.SetRuntimeMode(r.Context(), instanceID, *req.RuntimeMode)
+				if err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
 			}
-			updated, err := s.Store.GetInstance(r.Context(), instanceID)
-			if err != nil {
-				writeError(w, http.StatusInternalServerError, err.Error())
-				return
+			if req.Name != nil {
+				inst.Name = *req.Name
+				if err := s.Store.UpsertInstance(r.Context(), inst); err != nil {
+					writeError(w, http.StatusBadRequest, err.Error())
+					return
+				}
+				inst, err = s.Store.GetInstance(r.Context(), instanceID)
+				if err != nil {
+					writeError(w, http.StatusInternalServerError, err.Error())
+					return
+				}
 			}
-			writeJSON(w, http.StatusOK, newInstanceResponse(updated))
+			writeJSON(w, http.StatusOK, s.instanceResponse(r.Context(), inst))
 		case http.MethodDelete:
 			if err := s.Supervisor.DeleteInstance(r.Context(), instanceID); err != nil {
 				writeError(w, http.StatusBadRequest, err.Error())
@@ -1222,7 +1315,7 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 			writeError(w, http.StatusBadRequest, updateErr.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, newInstanceResponse(inst))
+		writeJSON(w, http.StatusOK, s.instanceResponse(r.Context(), inst))
 		return
 	case "secret":
 		var req struct {
@@ -1238,7 +1331,7 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 			writeError(w, http.StatusBadRequest, updateErr.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, newInstanceResponse(inst))
+		writeJSON(w, http.StatusOK, s.instanceResponse(r.Context(), inst))
 		return
 	default:
 		writeError(w, http.StatusNotFound, "unknown instance action")
@@ -1253,7 +1346,7 @@ func (s *Server) handleInstancePath(w http.ResponseWriter, r *http.Request, inst
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, newInstanceResponse(inst))
+	writeJSON(w, http.StatusOK, s.instanceResponse(r.Context(), inst))
 }
 
 func (s *Server) echoInstancePath(c *echo.Context) error {

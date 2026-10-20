@@ -2,6 +2,7 @@ name: docker
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - .github/workflows/docker.yml
       - docker/**
@@ -16,6 +17,10 @@ on:
     tags:
       - v*
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
   packages: write
@@ -26,7 +31,10 @@ env:
 
 jobs:
   build-and-push:
+    # Draft PRs are skipped; ready_for_review re-runs the workflow.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -38,6 +46,8 @@ jobs:
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
       - name: Set up QEMU
+        # arm64 emulation is only needed when publishing a multi-arch image.
+        if: github.event_name != 'pull_request'
         uses: docker/setup-qemu-action@v3
         with:
           platforms: amd64,arm64
@@ -62,12 +72,14 @@ jobs:
           context: .
           file: docker/Dockerfile
           push: false
-          platforms: linux/amd64,linux/arm64
+          # PR validation builds the native architecture only; the multi-arch
+          # image is produced on main/tags where QEMU is available.
+          platforms: linux/amd64
           build-args: |
             OCTOBUS_VERSION=${{ github.ref_name }}
             OCTOBUS_COMMIT=${{ steps.metadata.outputs.commit }}
             OCTOBUS_BUILD_DATE=${{ steps.metadata.outputs.date }}
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
+          cache-from: type=gha
 
       - name: Build and push
         if: github.event_name != 'pull_request'
@@ -84,5 +96,5 @@ jobs:
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
-          cache-from: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache
-          cache-to: type=registry,ref=${{ env.IMAGE_NAME }}:buildcache,mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max

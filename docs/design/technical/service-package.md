@@ -182,6 +182,8 @@ recursive 模式不接受用户指定 service id，导入的 service id 来自�
 - `long-running` service 的 instance 创建或启动后会拉起常驻 Node.js gRPC 子进程；daemon 重启时会恢复 `enabled=true` 的 long-running instances。
 - `on-demand` service 的 instance 不预启动、不保存 PID 或监听地址；请求到达时，OctoBus 为该请求启动一次短生命周期 `invoke` 子进程。
 - `on-demand` instance 会保持 enabled/running 的逻辑状态，但不支持 `start`、`stop`、`restart` 或带 `--restart` 的配置/密钥更新。
+- instance 可以覆盖 Service 的 `runtime.mode`：创建时传 `runtime_mode`，或通过 `PATCH /admin/v1/instances/{id}` 修改；空值表示继承。覆盖为 `on-demand` 时，切换会先停掉常驻进程再进入逻辑 running；切回 `long-running` 时按 enabled 状态重新启动。daemon 重启恢复按有效模式判断，不会拉起按需实例。
+- 覆盖为 `on-demand` 要求包本身实现 `--runtime invoke`（SDK 的 `runServiceMain` 同时支持 serve 和 invoke）；OctoBus 无法在导入时静态验证这一点。
 
 校验规则：
 
@@ -560,6 +562,8 @@ grpc.health.v1.Health/Check service=""
 ```
 
 OctoBus 会把 protobuf wire-format 请求写入 stdin，期望 stdout 只输出 protobuf wire-format 响应。on-demand 和 long-running 使用同一个 package artifact、runtime dir、node entry、config、secret 和 descriptor。`@chaitin-ai/octobus-sdk` 的 `runServiceMain(service)` 未带 `--runtime` 时进入业务 CLI；带 `--runtime` 时才解析 `serve`、`invoke`、`dev`、`inspect`、`client-stub` 和 `client-package` 等 runtime/tooling 命令。
+
+单次调用超时、单次输出上限和全局并发默认分别为 30 秒、8 MiB、32；可用 `--on-demand-timeout`、`--on-demand-max-output`、`--on-demand-concurrency` 或对应的 `OCTOBUS_ONDEMAND_*` 环境变量调整。
 
 ## Inspect 协议
 

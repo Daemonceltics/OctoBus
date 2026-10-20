@@ -117,6 +117,9 @@ func (s *Store) Migrate(ctx context.Context) error {
 	if err := addColumnIfMissing(ctx, s.db, "services", "service_root", "TEXT NOT NULL DEFAULT '.'"); err != nil {
 		return err
 	}
+	if err := addColumnIfMissing(ctx, s.db, "instances", "runtime_mode", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	_, err := s.db.ExecContext(ctx, `UPDATE services SET runtime_mode = 'long-running' WHERE runtime_mode = ''`)
 	return err
 }
@@ -314,8 +317,8 @@ func (s *Store) UpsertInstance(ctx context.Context, inst domain.Instance) error 
 		pid = *inst.PID
 	}
 	_, err := s.db.ExecContext(ctx, `
-INSERT INTO instances (id, service_id, name, enabled, status, pid, listen_addr, node_entry, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at)
-VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+INSERT INTO instances (id, service_id, name, enabled, status, pid, listen_addr, node_entry, runtime_mode, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 ON CONFLICT(id) DO UPDATE SET
   service_id=excluded.service_id,
   name=excluded.name,
@@ -324,16 +327,17 @@ ON CONFLICT(id) DO UPDATE SET
   pid=excluded.pid,
   listen_addr=excluded.listen_addr,
   node_entry=excluded.node_entry,
+  runtime_mode=excluded.runtime_mode,
   config_json=excluded.config_json,
   config_sha256=excluded.config_sha256,
   secret_json=excluded.secret_json,
   secret_sha256=excluded.secret_sha256,
-  updated_at=excluded.updated_at`, inst.ID, inst.ServiceID, inst.Name, boolInt(inst.Enabled), string(inst.Status), pid, inst.ListenAddr, inst.NodeEntry, string(inst.ConfigJSON), inst.ConfigSHA256, string(inst.SecretJSON), inst.SecretSHA256, formatTime(inst.CreatedAt), formatTime(inst.UpdatedAt))
+  updated_at=excluded.updated_at`, inst.ID, inst.ServiceID, inst.Name, boolInt(inst.Enabled), string(inst.Status), pid, inst.ListenAddr, inst.NodeEntry, string(inst.RuntimeMode), string(inst.ConfigJSON), inst.ConfigSHA256, string(inst.SecretJSON), inst.SecretSHA256, formatTime(inst.CreatedAt), formatTime(inst.UpdatedAt))
 	return err
 }
 
 func (s *Store) GetInstance(ctx context.Context, id string) (domain.Instance, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, service_id, name, enabled, status, pid, listen_addr, node_entry, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at FROM instances WHERE id = ?`, id)
+	row := s.db.QueryRowContext(ctx, `SELECT id, service_id, name, enabled, status, pid, listen_addr, node_entry, runtime_mode, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at FROM instances WHERE id = ?`, id)
 	return scanInstance(row)
 }
 
@@ -343,12 +347,13 @@ func scanInstance(scanner interface {
 	var inst domain.Instance
 	var enabled int
 	var pid sql.NullInt64
-	var status, config, secret, created, updated string
-	if err := scanner.Scan(&inst.ID, &inst.ServiceID, &inst.Name, &enabled, &status, &pid, &inst.ListenAddr, &inst.NodeEntry, &config, &inst.ConfigSHA256, &secret, &inst.SecretSHA256, &created, &updated); err != nil {
+	var status, runtimeMode, config, secret, created, updated string
+	if err := scanner.Scan(&inst.ID, &inst.ServiceID, &inst.Name, &enabled, &status, &pid, &inst.ListenAddr, &inst.NodeEntry, &runtimeMode, &config, &inst.ConfigSHA256, &secret, &inst.SecretSHA256, &created, &updated); err != nil {
 		return domain.Instance{}, err
 	}
 	inst.Enabled = enabled == 1
 	inst.Status = domain.InstanceStatus(status)
+	inst.RuntimeMode = domain.RuntimeMode(runtimeMode)
 	if pid.Valid {
 		p := int(pid.Int64)
 		inst.PID = &p
@@ -361,7 +366,7 @@ func scanInstance(scanner interface {
 }
 
 func (s *Store) ListInstances(ctx context.Context) ([]domain.Instance, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, service_id, name, enabled, status, pid, listen_addr, node_entry, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at FROM instances ORDER BY id`)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, service_id, name, enabled, status, pid, listen_addr, node_entry, runtime_mode, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at FROM instances ORDER BY id`)
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +383,7 @@ func (s *Store) ListInstances(ctx context.Context) ([]domain.Instance, error) {
 }
 
 func (s *Store) ListEnabledInstancesByService(ctx context.Context, serviceID string) ([]domain.Instance, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, service_id, name, enabled, status, pid, listen_addr, node_entry, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at FROM instances WHERE service_id = ? AND enabled = 1 ORDER BY id`, serviceID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id, service_id, name, enabled, status, pid, listen_addr, node_entry, runtime_mode, config_json, config_sha256, secret_json, secret_sha256, created_at, updated_at FROM instances WHERE service_id = ? AND enabled = 1 ORDER BY id`, serviceID)
 	if err != nil {
 		return nil, err
 	}
@@ -954,7 +959,7 @@ func (s *Store) queryExposedMethods(ctx context.Context, where string, args []an
 SELECT c.id, c.name, c.description, c.enabled, c.created_at, c.updated_at,
        ci.id, ci.capset_id, ci.service_id, ci.instance_id, ci.alias, ci.include_all_methods, ci.enabled, ci.created_at, ci.updated_at,
        cm.id, cm.capset_instance_id, cm.method_full_name, cm.rest_alias, cm.mcp_tool_name, cm.enabled, cm.created_at, cm.updated_at,
-       i.id, i.service_id, i.name, i.enabled, i.status, i.pid, i.listen_addr, i.node_entry, i.config_json, i.config_sha256, i.created_at, i.updated_at,
+       i.id, i.service_id, i.name, i.enabled, i.status, i.pid, i.listen_addr, i.node_entry, i.runtime_mode, i.config_json, i.config_sha256, i.created_at, i.updated_at,
        s.id, s.name, s.package_source, s.package_artifact_path, s.package_sha256, s.package_version, s.proto_bundle_path, s.proto_bundle_sha256,
        s.descriptor_path, s.descriptor_sha256, s.descriptor_version, s.methods_json, s.node_entry, s.service_root, s.runtime_mode, s.config_schema_path, s.secret_schema_path, s.created_at, s.updated_at
 FROM capsets c
@@ -995,13 +1000,13 @@ func scanExposedMethod(scanner interface {
 	var capEnabled, ciIncludeAll, ciEnabled, cmEnabled, instEnabled int
 	var capCreated, capUpdated, ciCreated, ciUpdated, cmCreated, cmUpdated, instCreated, instUpdated string
 	var svcMethodsJSON, svcCreated, svcUpdated string
-	var svcRuntimeMode string
+	var svcRuntimeMode, instRuntimeMode string
 	var status, config string
 	var pid sql.NullInt64
 	if err := scanner.Scan(&item.Capset.ID, &item.Capset.Name, &item.Capset.Description, &capEnabled, &capCreated, &capUpdated,
 		&item.CapsetInstance.ID, &item.CapsetInstance.CapsetID, &item.CapsetInstance.ServiceID, &item.CapsetInstance.InstanceID, &item.CapsetInstance.Alias, &ciIncludeAll, &ciEnabled, &ciCreated, &ciUpdated,
 		&item.CapsetMethod.ID, &item.CapsetMethod.CapsetInstanceID, &item.CapsetMethod.MethodFullName, &item.CapsetMethod.RestAlias, &item.CapsetMethod.MCPToolName, &cmEnabled, &cmCreated, &cmUpdated,
-		&item.Instance.ID, &item.Instance.ServiceID, &item.Instance.Name, &instEnabled, &status, &pid, &item.Instance.ListenAddr, &item.Instance.NodeEntry, &config, &item.Instance.ConfigSHA256, &instCreated, &instUpdated,
+		&item.Instance.ID, &item.Instance.ServiceID, &item.Instance.Name, &instEnabled, &status, &pid, &item.Instance.ListenAddr, &item.Instance.NodeEntry, &instRuntimeMode, &config, &item.Instance.ConfigSHA256, &instCreated, &instUpdated,
 		&service.ID, &service.Name, &service.PackageSource, &service.PackageArtifactPath, &service.PackageSHA256, &service.PackageVersion, &service.ProtoBundlePath, &service.ProtoBundleSHA256,
 		&service.DescriptorPath, &service.DescriptorSHA256, &service.DescriptorVersion, &svcMethodsJSON, &service.NodeEntry, &service.ServiceRoot, &svcRuntimeMode, &service.ConfigSchemaPath, &service.SecretSchemaPath, &svcCreated, &svcUpdated); err != nil {
 		return ExposedMethod{}, false, err
@@ -1034,6 +1039,7 @@ func scanExposedMethod(scanner interface {
 	item.CapsetMethod.UpdatedAt = parseTime(cmUpdated)
 	item.Instance.Enabled = instEnabled == 1
 	item.Instance.Status = domain.InstanceStatus(status)
+	item.Instance.RuntimeMode = domain.RuntimeMode(instRuntimeMode)
 	if pid.Valid {
 		p := int(pid.Int64)
 		item.Instance.PID = &p
@@ -1304,6 +1310,7 @@ CREATE TABLE IF NOT EXISTS instances (
   pid INTEGER,
   listen_addr TEXT,
   node_entry TEXT NOT NULL,
+  runtime_mode TEXT NOT NULL DEFAULT '',
   config_json TEXT NOT NULL,
   config_sha256 TEXT NOT NULL DEFAULT '',
   secret_json TEXT NOT NULL DEFAULT '{}',

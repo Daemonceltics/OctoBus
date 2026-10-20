@@ -2096,6 +2096,105 @@ func TestOnDemandRuntimeControlRoutesRejectPersistentActions(t *testing.T) {
 	}
 }
 
+func TestInstanceRuntimeModeOverrideAdminRoutes(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertService(ctx, domain.Service{ID: "echo", Name: "Echo", PackageSource: "fixture", PackageArtifactPath: "pkg", PackageSHA256: "pkgsha", DescriptorPath: "desc", DescriptorSHA256: "descsha", DescriptorVersion: "descsha", NodeEntry: "missing-entry", RuntimeMode: domain.RuntimeModeLongRunning}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Store: st, Supervisor: supervisor.New(dataDir, st)}
+
+	serveAdmin(t, srv, http.MethodPost, "/admin/v1/instances", bytes.NewBufferString(`{"id":"echo-test","service_id":"echo","name":"Echo Test","config":{},"secret":{},"start":false}`), http.StatusOK)
+
+	body := serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{"runtime_mode":"on-demand"}`), http.StatusOK)
+	var resp struct {
+		RuntimeMode          domain.RuntimeMode    `json:"RuntimeMode"`
+		EffectiveRuntimeMode domain.RuntimeMode    `json:"EffectiveRuntimeMode"`
+		Enabled              bool                  `json:"Enabled"`
+		Status               domain.InstanceStatus `json:"Status"`
+	}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.RuntimeMode != domain.RuntimeModeOnDemand ||
+		resp.EffectiveRuntimeMode != domain.RuntimeModeOnDemand ||
+		!resp.Enabled || resp.Status != domain.StatusRunning {
+		t.Fatalf("unexpected mode switch response: %+v", resp)
+	}
+	row, err := st.GetInstance(ctx, "echo-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.PID != nil || row.ListenAddr != "" || row.RuntimeMode != domain.RuntimeModeOnDemand {
+		t.Fatalf("unexpected on-demand row: %+v", row)
+	}
+
+	serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{"runtime_mode":"sometimes"}`), http.StatusBadRequest)
+	serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{}`), http.StatusBadRequest)
+}
+
+func TestInstancePatchRejectsInvalidModeWithoutRenaming(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertService(ctx, domain.Service{ID: "echo", Name: "Echo", PackageSource: "fixture", PackageArtifactPath: "pkg", PackageSHA256: "pkgsha", DescriptorPath: "desc", DescriptorSHA256: "descsha", DescriptorVersion: "descsha", NodeEntry: "missing-entry", RuntimeMode: domain.RuntimeModeLongRunning}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Store: st, Supervisor: supervisor.New(dataDir, st)}
+	serveAdmin(t, srv, http.MethodPost, "/admin/v1/instances", bytes.NewBufferString(`{"id":"echo-test","service_id":"echo","name":"Echo Test","config":{},"secret":{},"start":false}`), http.StatusOK)
+
+	serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{"name":"Renamed","runtime_mode":"sometimes"}`), http.StatusBadRequest)
+
+	row, err := st.GetInstance(ctx, "echo-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Name != "Echo Test" {
+		t.Fatalf("name changed despite the rejected mode: %q", row.Name)
+	}
+}
+
+func TestInstancePatchModeFailureKeepsName(t *testing.T) {
+	ctx := context.Background()
+	dataDir := t.TempDir()
+	st, err := store.Open(filepath.Join(dataDir, "octobus.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+	if err := st.UpsertService(ctx, domain.Service{ID: "echo", Name: "Echo", PackageSource: "fixture", PackageArtifactPath: "pkg", PackageSHA256: "pkgsha", DescriptorPath: "desc", DescriptorSHA256: "descsha", DescriptorVersion: "descsha", NodeEntry: "missing-entry", RuntimeMode: domain.RuntimeModeLongRunning}); err != nil {
+		t.Fatal(err)
+	}
+	srv := &Server{Store: st, Supervisor: supervisor.New(dataDir, st)}
+	serveAdmin(t, srv, http.MethodPost, "/admin/v1/instances", bytes.NewBufferString(`{"id":"echo-test","service_id":"echo","name":"Echo Test","config":{},"secret":{},"start":false,"runtime_mode":"on-demand"}`), http.StatusOK)
+
+	// Switching back to long-running tries to start the missing entry and fails.
+	serveAdmin(t, srv, http.MethodPatch, "/admin/v1/instances/echo-test", bytes.NewBufferString(`{"name":"Renamed","runtime_mode":"long-running"}`), http.StatusBadRequest)
+
+	row, err := st.GetInstance(ctx, "echo-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.Name != "Echo Test" {
+		t.Fatalf("name changed although the mode switch failed: %q", row.Name)
+	}
+	if row.RuntimeMode != domain.RuntimeModeOnDemand {
+		t.Fatalf("failed switch changed runtime_mode: %q", row.RuntimeMode)
+	}
+	if row.Status != domain.StatusRunning || row.PID != nil {
+		t.Fatalf("failed switch left unexpected state: %+v", row)
+	}
+}
+
 func TestServiceRoutesIncludeRuntimeMode(t *testing.T) {
 	ctx := context.Background()
 	dataDir := t.TempDir()

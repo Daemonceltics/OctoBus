@@ -2,6 +2,7 @@ name: ci
 
 on:
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - main
@@ -9,13 +10,21 @@ on:
       - v*
       - sdk-v*
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
 jobs:
   validate:
     name: validate
+    # Draft PRs are intentionally skipped; marking the PR ready for review
+    # triggers the ready_for_review event and runs this job.
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -120,6 +129,7 @@ jobs:
   publish-sdk:
     name: publish SDK
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: validate
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/sdk-v')
     permissions:
@@ -208,6 +218,7 @@ jobs:
   publish-octobus:
     name: publish OctoBus
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     needs: validate
     if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     permissions:

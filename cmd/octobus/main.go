@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -58,6 +59,9 @@ func newServeCommand(addr *string) *cobra.Command {
 	var dataDir string
 	var dev bool
 	var runtimeHardening string
+	var onDemandTimeoutText string
+	var onDemandMaxOutputText string
+	var onDemandConcurrency int
 	cmd := &cobra.Command{
 		Use:   "serve",
 		Short: "Run the Octobus daemon",
@@ -72,12 +76,46 @@ func newServeCommand(addr *string) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("%s: %w", source, err)
 			}
-			return serve(serveOptions{dataDir: dataDir, addr: *addr, dev: dev, runtimeHardening: level})
+			if !cmd.Flags().Changed("on-demand-timeout") {
+				onDemandTimeoutText = os.Getenv("OCTOBUS_ONDEMAND_TIMEOUT")
+			}
+			if !cmd.Flags().Changed("on-demand-max-output") {
+				onDemandMaxOutputText = os.Getenv("OCTOBUS_ONDEMAND_MAX_OUTPUT")
+			}
+			if !cmd.Flags().Changed("on-demand-concurrency") {
+				if v := os.Getenv("OCTOBUS_ONDEMAND_CONCURRENCY"); v != "" {
+					parsed, parseErr := strconv.Atoi(v)
+					if parseErr != nil {
+						return fmt.Errorf("OCTOBUS_ONDEMAND_CONCURRENCY: %w", parseErr)
+					}
+					onDemandConcurrency = parsed
+				}
+			}
+			onDemandTimeout, err := parseOptionalDuration("on-demand-timeout", onDemandTimeoutText)
+			if err != nil {
+				return err
+			}
+			onDemandMaxOutput, err := parseOptionalBytes("on-demand-max-output", onDemandMaxOutputText)
+			if err != nil {
+				return err
+			}
+			return serve(serveOptions{
+				dataDir:                dataDir,
+				addr:                   *addr,
+				dev:                    dev,
+				runtimeHardening:       level,
+				onDemandTimeout:        onDemandTimeout,
+				onDemandMaxOutputBytes: onDemandMaxOutput,
+				onDemandConcurrency:    onDemandConcurrency,
+			})
 		},
 	}
 	cmd.Flags().StringVar(&dataDir, "data-dir", defaultDataDir(), "octobus data directory")
 	cmd.Flags().BoolVar(&dev, "dev", false, "seed a fixed development admin token when none exists; requires a loopback listen address (not for production)")
 	cmd.Flags().StringVar(&runtimeHardening, "runtime-hardening", string(hardening.LevelOff), "restrictions applied to service runtimes: off, or node for an environment allowlist plus the Node.js permission model (requires Node.js 22.13+, 23.5+, or 24+; env OCTOBUS_RUNTIME_HARDENING)")
+	cmd.Flags().StringVar(&onDemandTimeoutText, "on-demand-timeout", "", "per-invocation timeout for on-demand runtimes (default 30s; env OCTOBUS_ONDEMAND_TIMEOUT)")
+	cmd.Flags().StringVar(&onDemandMaxOutputText, "on-demand-max-output", "", "stdout/stderr byte limit for one on-demand invocation (default 8388608; env OCTOBUS_ONDEMAND_MAX_OUTPUT)")
+	cmd.Flags().IntVar(&onDemandConcurrency, "on-demand-concurrency", 0, "maximum concurrent on-demand processes (default 32; env OCTOBUS_ONDEMAND_CONCURRENCY)")
 	return cmd
 }
 
@@ -86,10 +124,42 @@ type serveOptions struct {
 	addr             string
 	dev              bool
 	runtimeHardening hardening.Level
-	checkNode        func(context.Context) (hardening.Node, error)
-	stderr           io.Writer
-	logger           *slog.Logger
-	startupInventory func(context.Context, *slog.Logger, *store.Store) error
+	// Zero values keep the on-demand defaults.
+	onDemandTimeout        time.Duration
+	onDemandMaxOutputBytes int64
+	onDemandConcurrency    int
+	checkNode              func(context.Context) (hardening.Node, error)
+	stderr                 io.Writer
+	logger                 *slog.Logger
+	startupInventory       func(context.Context, *slog.Logger, *store.Store) error
+}
+
+func parseOptionalDuration(name, value string) (time.Duration, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, nil
+	}
+	parsed, err := time.ParseDuration(value)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("%s must be positive", name)
+	}
+	return parsed, nil
+}
+
+func parseOptionalBytes(name, value string) (int64, error) {
+	if strings.TrimSpace(value) == "" {
+		return 0, nil
+	}
+	parsed, err := strconv.ParseInt(value, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("%s: %w", name, err)
+	}
+	if parsed <= 0 {
+		return 0, fmt.Errorf("%s must be positive", name)
+	}
+	return parsed, nil
 }
 
 const (
@@ -166,7 +236,18 @@ func serve(opts serveOptions) error {
 		return fmt.Errorf("open access log: %w", err)
 	}
 	defer accessLogger.Close()
-	gateway := &protocol.Gateway{Store: st, DataDir: dataDir, AccessLogger: accessLogger, Logger: logger, RuntimeHardening: opts.runtimeHardening, RuntimeNode: runtimeNode, RuntimeRulesPath: runtimeRulesPath}
+	gateway := &protocol.Gateway{
+		Store:                  st,
+		DataDir:                dataDir,
+		AccessLogger:           accessLogger,
+		Logger:                 logger,
+		RuntimeHardening:       opts.runtimeHardening,
+		RuntimeNode:            runtimeNode,
+		RuntimeRulesPath:       runtimeRulesPath,
+		OnDemandTimeout:        opts.onDemandTimeout,
+		OnDemandMaxOutputBytes: opts.onDemandMaxOutputBytes,
+		OnDemandConcurrency:    opts.onDemandConcurrency,
+	}
 	sup := supervisor.New(dataDir, st)
 	sup.Logger = logger
 	sup.RuntimeHardening = opts.runtimeHardening
