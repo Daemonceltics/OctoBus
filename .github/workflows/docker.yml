@@ -1,25 +1,16 @@
 name: docker
 
 on:
-  pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
-    paths:
-      - .github/workflows/docker.yml
-      - docker/**
-      - cmd/**
-      - internal/**
-      - scripts/build-octobus.sh
-      - go.mod
-      - go.sum
   push:
     branches:
       - main
     tags:
       - v*
+  workflow_dispatch:
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 permissions:
   contents: read
@@ -31,10 +22,8 @@ env:
 
 jobs:
   build-and-push:
-    # Draft PRs are skipped; ready_for_review re-runs the workflow.
-    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 20
+    timeout-minutes: 45
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,9 +34,35 @@ jobs:
           echo "commit=${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Cross-compile binaries
+        env:
+          OCTOBUS_VERSION: ${{ github.ref_name }}
+          OCTOBUS_COMMIT: ${{ steps.metadata.outputs.commit }}
+          OCTOBUS_BUILD_DATE: ${{ steps.metadata.outputs.date }}
+        run: |
+          mkdir -p dist
+          for arch in amd64 arm64; do
+            GOOS=linux GOARCH=$arch bash ./scripts/build-octobus.sh "dist/octobus-linux-$arch"
+            # file(1) reads the ELF header, so the static-link check works for
+            # both architectures; host ldd cannot execute a foreign-arch
+            # interpreter and would pass any cross-compiled binary vacuously.
+            if file "dist/octobus-linux-$arch" | grep -q "statically linked"; then
+              continue
+            fi
+            echo "::error::dist/octobus-linux-$arch is dynamically linked; expected a static binary"
+            file "dist/octobus-linux-$arch"
+            exit 1
+          done
+
       - name: Set up QEMU
-        # arm64 emulation is only needed when publishing a multi-arch image.
-        if: github.event_name != 'pull_request'
+        # The runtime layer still executes arm64 apt/user-management steps;
+        # only the Go toolchain is cross-compiled natively above.
         uses: docker/setup-qemu-action@v3
         with:
           platforms: amd64,arm64
@@ -58,7 +73,7 @@ jobs:
           platforms: linux/amd64,linux/arm64
 
       - name: Login to Docker Hub
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -66,33 +81,23 @@ jobs:
           password: ${{ secrets.DOCKERIO_PASSWORD }}
 
       - name: Build
-        if: github.event_name == 'pull_request'
+        if: github.event_name != 'push' || !startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/Dockerfile
           push: false
-          # PR validation builds the native architecture only; the multi-arch
-          # image is produced on main/tags where QEMU is available.
-          platforms: linux/amd64
-          build-args: |
-            OCTOBUS_VERSION=${{ github.ref_name }}
-            OCTOBUS_COMMIT=${{ steps.metadata.outputs.commit }}
-            OCTOBUS_BUILD_DATE=${{ steps.metadata.outputs.date }}
+          platforms: linux/amd64,linux/arm64
           cache-from: type=gha
 
       - name: Build and push
-        if: github.event_name != 'pull_request'
+        if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
         uses: docker/build-push-action@v5
         with:
           context: .
           file: docker/Dockerfile
           push: true
           platforms: linux/amd64,linux/arm64
-          build-args: |
-            OCTOBUS_VERSION=${{ github.ref_name }}
-            OCTOBUS_COMMIT=${{ steps.metadata.outputs.commit }}
-            OCTOBUS_BUILD_DATE=${{ steps.metadata.outputs.date }}
           tags: |
             ${{ env.IMAGE_NAME }}:latest
             ${{ env.IMAGE_NAME }}:${{ github.ref_name }}
