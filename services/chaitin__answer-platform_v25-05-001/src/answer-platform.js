@@ -2,6 +2,7 @@
 // JSON-RPC 2.0 proxy over HTTP with cookie-based session management.
 
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { Agent } from 'undici';
 
 import { GrpcError, grpcStatus } from '@chaitin-ai/octobus-sdk';
@@ -23,6 +24,7 @@ const GET_SYSTEM_STATUS = 'Answer_Platform.Answer_Platform/GetSystemStatus';
 const SEARCH_ASSETS = 'Answer_Platform.Answer_Platform/SearchAssets';
 const LOGOUT = 'Answer_Platform.Answer_Platform/Logout';
 const GET_AGENT_GROUPS = 'Answer_Platform.Answer_Platform/GetAgentGroups';
+const GET_LICENSE = 'Answer_Platform.Answer_Platform/GetLicense';
 
 const DEFAULT_TIMEOUT_MS = 30000;
 const DEFAULT_MAX_RESPONSE_BYTES = 4 * 1024 * 1024;
@@ -114,6 +116,10 @@ const normalizeBaseUrl = (url) => {
 };
 
 const resolveBaseUrl = (bindings) => normalizeBaseUrl(bindings?.restBaseUrl);
+
+const resolveProxyUrl = (bindings = {}) => String(
+  unwrapScalar(firstDefined(bindings?.proxy_url, bindings?.proxyUrl)) ?? ''
+).trim();
 
 
 const limitPageSize = (val) => {
@@ -208,6 +214,71 @@ const removeSession = (token) => {
 
 let rpcSeq = 0;
 
+// curl-based fetch for proxied requests (socks5h etc.). Returns a fetch-like
+// response object so the rest of rpcCall stays unchanged.
+const curlFetch = async (url, { method = 'POST', headers = {}, body } = {}, { timeoutMs, proxyUrl, skipTlsVerify } = {}) => {
+  const timeoutSec = String(Math.max(1, Math.ceil(timeoutMs / 1000)));
+  const args = [
+    '-sS', '-i',
+    '--connect-timeout', timeoutSec,
+    '--max-time', timeoutSec,
+  ];
+  if (proxyUrl) args.push('--proxy', proxyUrl);
+  if (skipTlsVerify) args.push('-k');
+  args.push('-X', method);
+  for (const [key, value] of Object.entries(headers)) args.push('-H', `${key}: ${value}`);
+  if (body !== undefined && body !== null) args.push('-d', String(body));
+  args.push(url);
+
+  const child = spawn('curl', args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.setEncoding('utf8');
+  child.stderr.setEncoding('utf8');
+  child.stdout.on('data', (chunk) => { stdout += chunk; });
+  child.stderr.on('data', (chunk) => { stderr += chunk; });
+
+  const exitCode = await new Promise((resolve) => {
+    child.on('error', () => resolve(-1));
+    child.on('close', resolve);
+  });
+
+  if (exitCode !== 0) {
+    const reason = stderr.trim() || `curl exited with ${exitCode}`;
+    if (exitCode === 28) throw errorWithCode('DEADLINE_EXCEEDED', `RPC timeout after ${timeoutMs}ms`);
+    throw errorWithCode('UNAVAILABLE', reason);
+  }
+
+  // -i output: status line + headers, blank line, then body
+  const headerEnd = stdout.indexOf('\r\n\r\n');
+  const rawHeaders = headerEnd >= 0 ? stdout.slice(0, headerEnd) : '';
+  const bodyText = headerEnd >= 0 ? stdout.slice(headerEnd + 4) : stdout;
+
+  const statusMatch = rawHeaders.match(/^HTTP\/\S+\s+(\d{3})/);
+  const status = statusMatch ? Number(statusMatch[1]) : 0;
+
+  const headerMap = {};
+  const setCookies = [];
+  for (const line of rawHeaders.split('\r\n').slice(1)) {
+    const idx = line.indexOf(':');
+    if (idx <= 0) continue;
+    const name = line.slice(0, idx).trim().toLowerCase();
+    const value = line.slice(idx + 1).trim();
+    if (name === 'set-cookie') setCookies.push(value);
+    else if (!(name in headerMap)) headerMap[name] = value;
+  }
+
+  return {
+    ok: status >= 200 && status < 300,
+    status,
+    headers: {
+      get: (name) => headerMap[String(name).toLowerCase()] ?? null,
+      getSetCookie: () => setCookies,
+    },
+    text: async () => bodyText,
+  };
+};
+
 const rpcCall = async (ctx, method, params = {}) => {
   const baseUrl = resolveBaseUrl(ctx?.bindings ?? {});
   if (!baseUrl) throw errorWithCode('INVALID_ARGUMENT', 'restBaseUrl/baseUrl is required (https://...)');
@@ -234,22 +305,32 @@ const rpcCall = async (ctx, method, params = {}) => {
     id: String(++rpcSeq),
   });
 
+  const proxyUrl = resolveProxyUrl(ctx?.bindings ?? {});
+
   let res;
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), timeoutMs);
-  try {
-    res = await fetch(`${baseUrl}${RPC_PATH}`, {
-      method: 'POST',
-      headers,
-      body,
-      signal: controller.signal,
-      ...tlsOpts,
+  if (proxyUrl) {
+    res = await curlFetch(`${baseUrl}${RPC_PATH}`, { method: 'POST', headers, body }, {
+      timeoutMs,
+      proxyUrl,
+      skipTlsVerify: toBoolean(ctx?.bindings?.skipTlsVerify),
     });
-  } catch (err) {
-    if (err.name === 'AbortError') throw errorWithCode('DEADLINE_EXCEEDED', `RPC timeout after ${timeoutMs}ms`);
-    throw errorWithCode('UNAVAILABLE', err?.cause?.message || err?.message || 'fetch failed');
-  } finally {
-    clearTimeout(timer);
+  } else {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+      res = await fetch(`${baseUrl}${RPC_PATH}`, {
+        method: 'POST',
+        headers,
+        body,
+        signal: controller.signal,
+        ...tlsOpts,
+      });
+    } catch (err) {
+      if (err.name === 'AbortError') throw errorWithCode('DEADLINE_EXCEEDED', `RPC timeout after ${timeoutMs}ms`);
+      throw errorWithCode('UNAVAILABLE', err?.cause?.message || err?.message || 'fetch failed');
+    } finally {
+      clearTimeout(timer);
+    }
   }
 
   // Capture set-cookie for session persistence
@@ -724,6 +805,48 @@ async function handleGetSystemStatus(req, ctx) {
   };
 }
 
+// --- License ---
+
+// -1 = 永久授权；否则为 Unix 时间戳(秒)，转成 ISO 8601 UTC 日期字符串。
+const formatLicenseTime = (value) => {
+  const n = Number(value);
+  if (Number.isFinite(n) && n > 0) {
+    const d = new Date(n * 1000);
+    if (!Number.isNaN(d.getTime())) return d.toISOString();
+  }
+  return String(value ?? '');
+};
+
+async function handleGetLicense(req, ctx) {
+  const callCtx = resolveCallContext(ctx);
+  const token = requireSessionToken(req);
+
+  const result = await authenticatedRpc(callCtx, token, 'HeraLicenseService.GetLicense', {});
+
+  const data = result?.data ?? result ?? {};
+
+  return {
+    code: resultCode(result),
+    msg: resultMsg(result),
+    company: String(data?.company ?? ''),
+    not_valid_before: formatLicenseTime(data?.not_valid_before),
+    not_valid_after: formatLicenseTime(data?.not_valid_after),
+    permanent: toBoolean(data?.permanent),
+    upgrade_permanent: toBoolean(data?.upgrade_permanent),
+    cannot_upgrade_after: formatLicenseTime(data?.cannot_upgrade_after),
+    cannot_upgrade_before: formatLicenseTime(data?.cannot_upgrade_before),
+    valid_expired: toBoolean(data?.valid_expired),
+    upgrade_expired: toBoolean(data?.upgrade_expired),
+    valid_expired_soon: toBoolean(data?.valid_expired_soon),
+    upgrade_expired_soon: toBoolean(data?.upgrade_expired_soon),
+    product_version: String(data?.product_version ?? ''),
+    license_type: String(data?.license_type ?? ''),
+    max_node_count: Number(data?.max_node_count ?? 0) || 0,
+    traffic_limit: String(data?.traffic_limit ?? ''),
+    raw: toStruct(result ?? {}),
+  };
+}
+
 // --- Assets ---
 
 async function handleSearchAssets(req, ctx) {
@@ -770,6 +893,7 @@ export const handlers = {
   [SEARCH_ASSETS]: adapt(handleSearchAssets),
   [LOGOUT]: adapt(handleLogout),
   [GET_AGENT_GROUPS]: adapt(handleGetAgentGroups),
+  [GET_LICENSE]: adapt(handleGetLicense),
 };
 
 // --- Test exports ---
