@@ -2,8 +2,10 @@
 // JSON-RPC 2.0 proxy over HTTP with cookie-based session management.
 
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import http from 'node:http';
+import https from 'node:https';
 import { Agent } from 'undici';
+import { SocksProxyAgent } from 'socks-proxy-agent';
 
 import { GrpcError, grpcStatus } from '@chaitin-ai/octobus-sdk';
 
@@ -214,70 +216,54 @@ const removeSession = (token) => {
 
 let rpcSeq = 0;
 
-// curl-based fetch for proxied requests (socks5h etc.). Returns a fetch-like
+// Native http(s) fetch for proxied requests (socks5h etc.) using
+// socks-proxy-agent, avoiding an external curl binary. Returns a fetch-like
 // response object so the rest of rpcCall stays unchanged.
-const curlFetch = async (url, { method = 'POST', headers = {}, body } = {}, { timeoutMs, proxyUrl, skipTlsVerify } = {}) => {
-  const timeoutSec = String(Math.max(1, Math.ceil(timeoutMs / 1000)));
-  const args = [
-    '-sS', '-i',
-    '--connect-timeout', timeoutSec,
-    '--max-time', timeoutSec,
-  ];
-  if (proxyUrl) args.push('--proxy', proxyUrl);
-  if (skipTlsVerify) args.push('-k');
-  args.push('-X', method);
-  for (const [key, value] of Object.entries(headers)) args.push('-H', `${key}: ${value}`);
-  if (body !== undefined && body !== null) args.push('-d', String(body));
-  args.push(url);
+const proxiedFetch = (url, { method = 'POST', headers = {}, body } = {}, { timeoutMs, proxyUrl, skipTlsVerify } = {}) => new Promise((resolve, reject) => {
+  const target = new URL(url);
+  const mod = target.protocol === 'https:' ? https : http;
+  const agent = new SocksProxyAgent(proxyUrl);
 
-  const child = spawn('curl', args, { stdio: ['ignore', 'pipe', 'pipe'] });
-  let stdout = '';
-  let stderr = '';
-  child.stdout.setEncoding('utf8');
-  child.stderr.setEncoding('utf8');
-  child.stdout.on('data', (chunk) => { stdout += chunk; });
-  child.stderr.on('data', (chunk) => { stderr += chunk; });
-
-  const exitCode = await new Promise((resolve) => {
-    child.on('error', () => resolve(-1));
-    child.on('close', resolve);
+  const req = mod.request(target, {
+    method,
+    headers,
+    agent,
+    rejectUnauthorized: !skipTlsVerify,
+  }, (res) => {
+    const chunks = [];
+    res.on('data', (chunk) => chunks.push(chunk));
+    res.on('end', () => {
+      const bodyText = Buffer.concat(chunks).toString('utf8');
+      const headerMap = {};
+      const setCookies = [];
+      for (const [name, value] of Object.entries(res.headers)) {
+        const key = name.toLowerCase();
+        if (key === 'set-cookie') setCookies.push(...(Array.isArray(value) ? value : [value]));
+        else if (!(key in headerMap)) headerMap[key] = Array.isArray(value) ? value.join(', ') : value;
+      }
+      resolve({
+        ok: res.statusCode >= 200 && res.statusCode < 300,
+        status: res.statusCode,
+        headers: {
+          get: (name) => headerMap[String(name).toLowerCase()] ?? null,
+          getSetCookie: () => setCookies,
+        },
+        text: async () => bodyText,
+      });
+    });
   });
 
-  if (exitCode !== 0) {
-    const reason = stderr.trim() || `curl exited with ${exitCode}`;
-    if (exitCode === 28) throw errorWithCode('DEADLINE_EXCEEDED', `RPC timeout after ${timeoutMs}ms`);
-    throw errorWithCode('UNAVAILABLE', reason);
-  }
-
-  // -i output: status line + headers, blank line, then body
-  const headerEnd = stdout.indexOf('\r\n\r\n');
-  const rawHeaders = headerEnd >= 0 ? stdout.slice(0, headerEnd) : '';
-  const bodyText = headerEnd >= 0 ? stdout.slice(headerEnd + 4) : stdout;
-
-  const statusMatch = rawHeaders.match(/^HTTP\/\S+\s+(\d{3})/);
-  const status = statusMatch ? Number(statusMatch[1]) : 0;
-
-  const headerMap = {};
-  const setCookies = [];
-  for (const line of rawHeaders.split('\r\n').slice(1)) {
-    const idx = line.indexOf(':');
-    if (idx <= 0) continue;
-    const name = line.slice(0, idx).trim().toLowerCase();
-    const value = line.slice(idx + 1).trim();
-    if (name === 'set-cookie') setCookies.push(value);
-    else if (!(name in headerMap)) headerMap[name] = value;
-  }
-
-  return {
-    ok: status >= 200 && status < 300,
-    status,
-    headers: {
-      get: (name) => headerMap[String(name).toLowerCase()] ?? null,
-      getSetCookie: () => setCookies,
-    },
-    text: async () => bodyText,
-  };
-};
+  req.setTimeout(timeoutMs, () => req.destroy(Object.assign(new Error('timeout'), { code: 'ETIMEDOUT' })));
+  req.on('error', (err) => {
+    if (err.code === 'ETIMEDOUT' || err.code === 'ESOCKETTIMEDOUT') {
+      reject(errorWithCode('DEADLINE_EXCEEDED', `RPC timeout after ${timeoutMs}ms`));
+    } else {
+      reject(errorWithCode('UNAVAILABLE', err.message || 'proxied request failed'));
+    }
+  });
+  if (body !== undefined && body !== null) req.write(String(body));
+  req.end();
+});
 
 const rpcCall = async (ctx, method, params = {}) => {
   const baseUrl = resolveBaseUrl(ctx?.bindings ?? {});
@@ -309,7 +295,7 @@ const rpcCall = async (ctx, method, params = {}) => {
 
   let res;
   if (proxyUrl) {
-    res = await curlFetch(`${baseUrl}${RPC_PATH}`, { method: 'POST', headers, body }, {
+    res = await proxiedFetch(`${baseUrl}${RPC_PATH}`, { method: 'POST', headers, body }, {
       timeoutMs,
       proxyUrl,
       skipTlsVerify: toBoolean(ctx?.bindings?.skipTlsVerify),
